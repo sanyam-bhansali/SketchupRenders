@@ -20,6 +20,7 @@ from skp2render import materials as matlib  # noqa: E402
 
 INHERIT = -1
 ADAPTIVE_THRESHOLD = float(os.environ.get("SKP_ADAPTIVE", "0.02"))
+WARM_K = 3300.0  # interior practical lights (warm white, as Indian interior renders are expected)
 LUMENS_PER_WATT = 683.0 / 4.0  # empirical Blender-light calibration; exposure is auto-balanced anyway
 
 
@@ -237,16 +238,104 @@ class Builder:
             elif self.opts.fixture_lights:
                 if self.add_fixture_light(d, xf, f"{d['name']}_{i}", occ):
                     n += 1
-        log(f"lights: {n}")
+        found = self.detect_ceiling_fixtures() if self.opts.fixture_lights else 0
+        log(f"lights: {n} from model data, {found} detected ceiling fixtures")
+
+    FIXTURE_EXCLUDE = re.compile(r"fan|\bac\b|air ?con|smoke|sprinkler|speaker|camera|sensor|curtain|rod|hook|"
+                                 r"frame|photo|clock|switch|socket|plant|vase", re.I)
+
+    def detect_ceiling_fixtures(self, max_lights=120):
+        """Downlights/spots in the geometry: small objects hanging on the ceiling.
+
+        Most SketchUp models carry no light data at all, but designers do model the fixtures.
+        A candidate is a compact object (<= 40 cm across, <= 30 cm tall) whose top touches a
+        ceiling (ray up hits within 12 cm) and which has open space below it.
+        """
+        scene = bpy.context.scene
+        dg = bpy.context.evaluated_depsgraph_get()
+        defs = self.data["definitions"]
+        lit = []
+        for ob, occ in list(self.objects):
+            if ob.type != "MESH" or occ["def"] == 0:
+                continue
+            d = defs[occ["def"]]
+            label = d["name"] + " " + " ".join(occ["path"])
+            if self.FIXTURE_EXCLUDE.search(label) or d.get("light"):
+                continue
+            corners = [ob.matrix_world @ Vector(c) for c in ob.bound_box]
+            lo = Vector([min(c[i] for c in corners) for i in range(3)])
+            hi = Vector([max(c[i] for c in corners) for i in range(3)])
+            size = hi - lo
+            if not (0.04 <= max(size.x, size.y) <= 0.4 and size.z <= 0.3 and lo.z > 1.9):
+                continue
+            centre = (lo + hi) / 2
+            top = Vector((centre.x, centre.y, hi.z - 0.005))
+            # Mounted on a ceiling: something (ceiling slab or the fixture's own trim) right above.
+            hit_up, *_ = scene.ray_cast(dg, top, Vector((0, 0, 1)), distance=0.15)
+            if not hit_up:
+                continue
+            below = Vector((centre.x, centre.y, lo.z - 0.01))
+            hit_dn, loc_dn, *_ = scene.ray_cast(dg, below, Vector((0, 0, -1)), distance=4.0)
+            if not hit_dn or (below - loc_dn).length < 1.2:
+                continue
+            key = (round(centre.x / 0.08), round(centre.y / 0.08))
+            if any(abs(key[0] - k[0]) <= 1 and abs(key[1] - k[1]) <= 1 for k in lit):
+                continue                      # nested sub-parts of the same fixture
+            lit.append(key)
+            self.add_downlight(f"Downlight_{len(lit)}", below, max(size.x, size.y), occ)
+            if len(lit) >= max_lights:
+                break
+        return len(lit)
+
+    def add_downlight(self, name, pos, fixture_size, occ):
+        ld = bpy.data.lights.new(name, "SPOT")
+        ld.spot_size = math.radians(100)
+        ld.spot_blend = 0.75
+        ld.energy = 650 / LUMENS_PER_WATT * self.opts.light_scale
+        ld.shadow_soft_size = 0.03
+        ld.color = kelvin_to_rgb(WARM_K)
+        ob = bpy.data.objects.new(name, ld)
+        ob.location = pos
+        self.light_coll.objects.link(ob)
+        self.objects.append((ob, occ))
+        # The lens itself glows (camera sees a lit downlight, bloom picks it up).
+        r = max(0.02, fixture_size * 0.3)
+        me = bpy.data.meshes.new(name + "_lens")
+        k = 12
+        verts = [(pos.x + r * math.cos(2 * math.pi * i / k), pos.y + r * math.sin(2 * math.pi * i / k), pos.z + 0.004)
+                 for i in range(k)]
+        me.from_pydata(verts, [], [tuple(range(k))[::-1]])
+        mat = bpy.data.materials.new(name + "_glow")
+        mat.use_nodes = True
+        nt = mat.node_tree
+        nt.nodes.clear()
+        em = nt.nodes.new("ShaderNodeEmission")
+        em.inputs["Color"].default_value = (*kelvin_to_rgb(WARM_K), 1)
+        em.inputs["Strength"].default_value = 25.0
+        nt.links.new(em.outputs[0], nt.nodes.new("ShaderNodeOutputMaterial").inputs[0])
+        me.materials.append(mat)
+        lens = bpy.data.objects.new(name + "_lens", me)
+        lens.visible_shadow = False
+        self.light_coll.objects.link(lens)
+        self.objects.append((lens, occ))
+
+    # Real-world light output. Enscape users routinely crank values 10-300x (Enscape
+    # auto-exposes), which would blow out a physically based render; clamp to plausible ranges.
+    LUMEN_RANGE = {"spot": (350, 1400), "point": (300, 1600), "rect": (400, 2500), "linear_per_m": (200, 700)}
 
     def add_enscape_light(self, light, xf, name, occ):
         lum = float(light.get("luminosity", 1000.0))
-        watts = lum / LUMENS_PER_WATT * self.opts.light_scale
         kind = light["kind"]
         if kind == "linear":
             length = light.get("length", 1.0) * xf.to_scale().y
+            lo, hi = self.LUMEN_RANGE["linear_per_m"]
+            lum = float(np.clip(lum / max(length, 0.05), lo, hi)) * max(length, 0.05)
+            watts = lum / LUMENS_PER_WATT * self.opts.light_scale
             self.add_tube(name, xf, length, watts, occ)
             return
+        key = "rect" if kind in ("rectangle", "rectangular", "area") else ("spot" if kind in ("spot", "ies") else "point")
+        lum = float(np.clip(lum, *self.LUMEN_RANGE[key]))
+        watts = lum / LUMENS_PER_WATT * self.opts.light_scale
         if kind in ("rectangle", "rectangular", "area"):
             ld = bpy.data.lights.new(name, "AREA")
             ld.shape = "RECTANGLE"
@@ -261,7 +350,7 @@ class Builder:
             ld = bpy.data.lights.new(name, "POINT")
             ld.shadow_soft_size = max(light.get("radius", 0.02), 0.02)
         ld.energy = watts
-        ld.color = kelvin_to_rgb(light.get("temperature", 4000.0))
+        ld.color = kelvin_to_rgb(light.get("temperature", WARM_K))
         if light.get("ies"):
             self.attach_ies(ld, os.path.join(self.pkg, light["ies"]))
         ob = bpy.data.objects.new(name, ld)
@@ -301,7 +390,7 @@ class Builder:
         nt.nodes.clear()
         out = nt.nodes.new("ShaderNodeOutputMaterial")
         em = nt.nodes.new("ShaderNodeEmission")
-        em.inputs["Color"].default_value = (*kelvin_to_rgb(3500.0), 1)
+        em.inputs["Color"].default_value = (*kelvin_to_rgb(WARM_K), 1)
         em.inputs["Strength"].default_value = watts / area
         nt.links.new(em.outputs[0], out.inputs[0])
         me.materials.append(mat)
@@ -396,6 +485,48 @@ class Builder:
         return n
 
     # ----------------------------------------------------------------------- sun & sky
+    @staticmethod
+    def _cloud_layer(nt, sep, sky_color):
+        """Soft procedural clouds on a sky 'plane' (x/z, y/z), faded toward the horizon."""
+        def math_node(op, a, b):
+            m = nt.nodes.new("ShaderNodeMath")
+            m.operation = op
+            for i, v in enumerate((a, b)):
+                if isinstance(v, (int, float)):
+                    m.inputs[i].default_value = v
+                else:
+                    nt.links.new(v, m.inputs[i])
+            return m.outputs[0]
+
+        zp = math_node("ADD", sep.outputs["Z"], 0.12)
+        u = math_node("DIVIDE", sep.outputs["X"], zp)
+        v = math_node("DIVIDE", sep.outputs["Y"], zp)
+        comb = nt.nodes.new("ShaderNodeCombineXYZ")
+        nt.links.new(u, comb.inputs["X"])
+        nt.links.new(v, comb.inputs["Y"])
+        noise = nt.nodes.new("ShaderNodeTexNoise")
+        noise.inputs["Scale"].default_value = 0.9
+        noise.inputs["Detail"].default_value = 8.0
+        noise.inputs["Roughness"].default_value = 0.58
+        nt.links.new(comb.outputs[0], noise.inputs["Vector"])
+        cover = nt.nodes.new("ShaderNodeMapRange")
+        cover.inputs["From Min"].default_value = 0.5
+        cover.inputs["From Max"].default_value = 0.72
+        nt.links.new(noise.outputs["Fac"], cover.inputs["Value"])
+        fade = nt.nodes.new("ShaderNodeMapRange")          # no clouds below / at the horizon
+        fade.inputs["From Min"].default_value = 0.0
+        fade.inputs["From Max"].default_value = 0.18
+        nt.links.new(sep.outputs["Z"], fade.inputs["Value"])
+        amount = math_node("MULTIPLY", cover.outputs[0], fade.outputs[0])
+        mix = nt.nodes.new("ShaderNodeMix")
+        mix.data_type = "RGBA"
+        a = next(s for s in mix.inputs if s.name == "A" and s.type == "RGBA")
+        b = next(s for s in mix.inputs if s.name == "B" and s.type == "RGBA")
+        nt.links.new(amount, mix.inputs["Factor"])
+        nt.links.new(sky_color, a)
+        b.default_value = (0.97, 0.97, 0.98, 1.0)
+        return next(s for s in mix.outputs if s.type == "RGBA")
+
     def build_environment(self, shadow):
         """Sky + ground dome and sun from SketchUp's shadow settings.
 
@@ -432,8 +563,10 @@ class Builder:
         bg_light = nt.nodes.new("ShaderNodeBackground")
         bg_cam = nt.nodes.new("ShaderNodeBackground")
         for bg in (bg_light, bg_cam):
-            nt.links.new(ramp.outputs["Color"], bg.inputs["Color"])
             bg.inputs["Strength"].default_value = self.opts.sky_strength
+        nt.links.new(ramp.outputs["Color"], bg_light.inputs["Color"])
+        cam_color = ramp.outputs["Color"] if night else self._cloud_layer(nt, sep, ramp.outputs["Color"])
+        nt.links.new(cam_color, bg_cam.inputs["Color"])
         path = nt.nodes.new("ShaderNodeLightPath")
         mix = nt.nodes.new("ShaderNodeMixShader")
         nt.links.new(path.outputs["Is Camera Ray"], mix.inputs[0])
@@ -453,7 +586,11 @@ class Builder:
             self.light_coll.objects.link(ob)
 
     # ----------------------------------------------------------------------- visibility
-    def auto_views(self, opts, plan_png):
+    def analyze_plan(self):
+        """Room analysis (floor, rooms, ceilings, per-room lights). Cached; also used when the
+        model has its own scenes, for lighting."""
+        if hasattr(self, "plan"):
+            return self.plan
         from skp2render import cameras
         defs = self.data["definitions"]
         hidden_layers = {l["index"] for l in self.data["layers"] if not l["visible"]}
@@ -476,23 +613,172 @@ class Builder:
             c = (np.array(d["bbox"][0]) + np.array(d["bbox"][1])) / 2
             M = np.array(occ["xf"])
             centres.append((tuple(M[:3, :3] @ c + M[:3, 3]), d["name"] + " " + " ".join(occ["path"])))
-        return cameras.plan_views(tris, centres, aspect=opts.aspect, log=log, plan_png=plan_png)
+        self.plan = cameras.analyze(tris, centres, log=log)
+        if self.plan is not None:
+            self.ceiling_data = self.plan.ceilings()
+            self.room_light_data = self.plan.room_lights()
+            if self.opts.auto_ceiling:
+                log(f"ceilings added: {self.add_ceilings(self.ceiling_data)}")
+        return self.plan
+
+    def auto_views(self, opts, plan_png):
+        plan = self.analyze_plan()
+        if plan is None:
+            return [], []
+        views = plan.choose_views(aspect=opts.aspect, scorer=lambda cams: self.score_cameras(cams, opts.aspect),
+                                  log=log)
+        plan.write_png(plan_png)
+        return views, plan.room_info()
+
+    def add_room_lights(self, room_lights, strength):
+        """Soft warm ceiling light in every room, so rooms seen through doors/glass aren't black."""
+        for i, rl in enumerate(room_lights):
+            ld = bpy.data.lights.new(f"RoomAmbient_{i}", "AREA")
+            ld.shape = "RECTANGLE"
+            ld.size, ld.size_y = rl["size"]
+            ld.energy = strength * rl["size"][0] * rl["size"][1]
+            ld.color = kelvin_to_rgb(3800.0)
+            ob = bpy.data.objects.new(f"RoomAmbient_{i}", ld)
+            ob.location = rl["centre"]
+            ob.visible_camera = False
+            ob.visible_glossy = False
+            self.light_coll.objects.link(ob)
+        return len(room_lights)
+
+    def add_strips(self, strips):
+        """Warm LED strips under kitchen wall cabinets (placements from the plan analysis)."""
+        for i, s in enumerate(strips):
+            pos = Vector(s["centre"])
+            # add_tube runs along local Y: rotate 90 degrees about Z when the run is along X.
+            m = Matrix.Translation(pos) @ (Matrix.Rotation(math.pi / 2, 4, "Z") if s["along_x"] else Matrix.Identity(4))
+            self.add_tube(f"UnderCabinet_{i}", m, s["length"], 450 * s["length"] / LUMENS_PER_WATT,
+                          {"layers": [], "eids": [], "model_hidden": False, "def": 0})
+        return len(strips)
+
+    def add_under_cabinet_strips(self, floor):
+        """Kitchen wall cabinets hanging over a counter get a warm LED strip underneath."""
+        scene = bpy.context.scene
+        dg = bpy.context.evaluated_depsgraph_get()
+        n = 0
+        for ob, occ in list(self.objects):
+            if ob.type != "MESH" or occ["def"] == 0:
+                continue
+            corners = [ob.matrix_world @ Vector(c) for c in ob.bound_box]
+            lo = Vector([min(c[i] for c in corners) for i in range(3)])
+            hi = Vector([max(c[i] for c in corners) for i in range(3)])
+            size = hi - lo
+            depth, width = sorted((size.x, size.y))
+            if not (floor + 1.25 < lo.z < floor + 1.8 and 0.22 < depth < 0.5 and width > 0.35
+                    and 0.25 < size.z < 1.2):
+                continue
+            centre = Vector(((lo.x + hi.x) / 2, (lo.y + hi.y) / 2, lo.z - 0.01))
+            hit, loc, *_ = scene.ray_cast(dg, centre, Vector((0, 0, -1)), distance=1.0)
+            if not hit or not (floor + 0.78 < loc.z < floor + 1.02):
+                continue                     # no counter directly below
+            along = Vector((1, 0, 0)) if size.x >= size.y else Vector((0, 1, 0))
+            across = Vector((-along.y, along.x, 0))
+            # Front = the side facing open space (the back side touches a wall).
+            back_hit = [scene.ray_cast(dg, centre + s * across * (depth / 2 + 0.02), s * across, distance=0.25)[0]
+                        for s in (1, -1)]
+            front = across if not back_hit[0] else -across
+            pos = centre + front * (depth * 0.3)
+            # add_tube runs along local Y: rotate 90 degrees about Z when the cabinet runs along X.
+            m = Matrix.Translation(pos) @ (Matrix.Rotation(math.pi / 2, 4, "Z") if along.x else Matrix.Identity(4))
+            self.add_tube(f"UnderCabinet_{n}", m, width * 0.9, 450 * width / LUMENS_PER_WATT, occ)
+            n += 1
+        return n
+
+    def structural_objects(self):
+        """Walls / slabs / the loose root geometry: 'empty' surfaces when judging a view."""
+        names = set()
+        for ob, occ in self.objects:
+            if ob.type != "MESH":
+                continue
+            if occ["def"] == 0:
+                names.add(ob.name)
+                continue
+            corners = [ob.matrix_world @ Vector(c) for c in ob.bound_box]
+            dims = sorted(max(c[i] for c in corners) - min(c[i] for c in corners) for i in range(3))
+            label = (self.data["definitions"][occ["def"]]["name"] + " " + " ".join(occ["path"])).lower()
+            # Walls/slabs, and doors: a door filling the frame is not a good subject.
+            if (dims[2] > 2.3 and dims[0] < 0.35) or re.search(r"door|shutter|frame|architrave", label):
+                names.add(ob.name)
+        return names
+
+    def score_cameras(self, cams, aspect, nx=24, ny=14):
+        """Judge candidate views by ray casting through their actual frames.
+
+        Rewards many distinct objects/materials in view and something interesting in the
+        centre; penalises obstructions at the lens, bare structure and looking into the void.
+        Returns [(score, set_of_object_names)].
+        """
+        scene = bpy.context.scene
+        if not hasattr(self, "_structural"):
+            self._structural = self.structural_objects()
+        self.apply_view_visibility({})
+        dg = bpy.context.evaluated_depsgraph_get()
+        out = []
+        for cam in cams:
+            eye = Vector(cam["eye"])
+            fwd = (Vector(cam["target"]) - eye).normalized()
+            right = fwd.cross(Vector((0, 0, 1))).normalized()
+            up = right.cross(fwd)
+            tv = math.tan(math.radians(cam["fov"]) / 2)
+            th = tv * aspect
+            n = near = void = plain = centre_n = centre_hit = low_n = low_close = 0
+            objs, mats = {}, set()
+            for iy in range(ny):
+                y = (iy + 0.5) / ny * 2 - 1
+                for ix in range(nx):
+                    x = (ix + 0.5) / nx * 2 - 1
+                    d = (fwd + right * (x * th) + up * (y * tv)).normalized()
+                    hit, loc, _, idx, ob, _ = scene.ray_cast(dg, eye, d, distance=40.0)
+                    n += 1
+                    central = abs(x) < 0.5 and abs(y) < 0.6
+                    centre_n += central
+                    if not hit:
+                        void += 1
+                        continue
+                    depth = (loc - eye).dot(fwd)
+                    if depth < 0.9:
+                        near += 1
+                    if y < -0.33:          # lower third: big furniture right in front crowds the shot
+                        low_n += 1
+                        low_close += depth < 1.5
+                    name = ob.name
+                    if name in self._structural or name.startswith("Ceiling"):
+                        plain += 1
+                    else:
+                        objs[name] = objs.get(name, 0) + 1
+                        centre_hit += central
+                    try:
+                        m = ob.data.materials[ob.data.polygons[idx].material_index]
+                        mats.add(m.name if m else "")
+                    except (IndexError, AttributeError):
+                        pass
+            # Objects covering at least 2 rays count as 'in the shot'.
+            seen = {k for k, v in objs.items() if v >= 2}
+            score = (1.0 * min(len(seen) / 10, 1.0) + 0.5 * min(len(mats) / 10, 1.0)
+                     + 0.7 * centre_hit / max(centre_n, 1)
+                     - 1.5 * near / n - 0.8 * max(0.0, plain / n - 0.6) - 0.5 * void / n
+                     - 0.6 * max(0.0, low_close / max(low_n, 1) - 0.3))
+            out.append((score, seen))
+        return out
 
     def add_ceilings(self, rooms):
         """Models often omit ceilings; a photoreal interior needs one (plain white paint)."""
         n = 0
         mat = None
-        for r in rooms:
-            c = r.get("ceiling")
-            if not c or not c["faces"]:
+        for c in rooms:
+            if not c["faces"]:
                 continue
             if mat is None:
                 mat = matlib.build_material({"name": "Auto Ceiling", "color": [0.93, 0.93, 0.91],
                                              "opacity": 1.0, "texture": None}, self.pkg)
-            me = bpy.data.meshes.new(f"ceiling_{r['name']}")
+            me = bpy.data.meshes.new(f"ceiling_{c['room']}")
             me.from_pydata(c["verts"], [], c["faces"])
             me.materials.append(mat)
-            ob = bpy.data.objects.new(f"Ceiling {r['name']}", me)
+            ob = bpy.data.objects.new(f"Ceiling {c['room']}", me)
             self.coll.objects.link(ob)
             n += 1
         return n
@@ -649,18 +935,29 @@ def room_fill_light(scene, cam_ob, strength):
     ld.shape = "RECTANGLE"
     ld.size, ld.size_y = sx, sy
     ld.energy = strength * sx * sy
-    ld.color = kelvin_to_rgb(4500.0)
+    ld.color = kelvin_to_rgb(3800.0)
     ob = bpy.data.objects.new("RoomFill", ld)
     ob.location = (cx, cy, ceiling - 0.08)
     ob.visible_camera = False
     ob.visible_glossy = False
     scene.collection.objects.link(ob)
+    # Bounce fill: a large soft omni light mid-room lifts the ceiling and upper walls, the way
+    # real interiors are lit by light bouncing off light floors and walls.
+    bl = bpy.data.lights.new("BounceFill", "POINT")
+    bl.shadow_soft_size = 0.7
+    bl.energy = strength * sx * sy * 1.6
+    bl.color = kelvin_to_rgb(3800.0)
+    bob = bpy.data.objects.new("BounceFill", bl)
+    bob.location = (cx, cy, max(ceiling - 1.0, eye.z))
+    bob.visible_camera = False
+    bob.visible_glossy = False
+    scene.collection.objects.link(bob)
     # Photographer's fill: soft light from just above/behind the lens so no view is black.
     cf = bpy.data.lights.new("CameraFill", "AREA")
     cf.shape = "DISK"
     cf.size = 1.2
     cf.energy = strength * 3.0
-    cf.color = kelvin_to_rgb(5000.0)
+    cf.color = kelvin_to_rgb(4200.0)
     cob = bpy.data.objects.new("CameraFill", cf)
     up = cam_ob.matrix_world.to_3x3() @ Vector((0, 1, 0))
     cob.matrix_world = Matrix.Translation(start + fwd * 0.05 + up * 0.15) @ \
@@ -668,7 +965,25 @@ def room_fill_light(scene, cam_ob, strength):
     cob.visible_camera = False
     cob.visible_glossy = False
     scene.collection.objects.link(cob)
-    return [ob, cob]
+    return [ob, cob, bob]
+
+
+def save_editable_blend(b, views, opts):
+    """Self-contained .blend (textures packed, one camera per view) for manual touch-ups."""
+    scene = bpy.context.scene
+    b.apply_view_visibility({})
+    cams = [make_camera(v["name"], v["camera"], v["camera"].get("aspect") or opts.aspect) for v in views]
+    if cams:
+        scene.camera = cams[0]
+    try:
+        bpy.ops.file.pack_all()
+    except RuntimeError as e:
+        log(f"could not pack textures: {e}")
+    path = os.path.join(opts.out, "scene.blend")
+    bpy.ops.wm.save_as_mainfile(filepath=path, compress=True)
+    log(f"saved editable scene: {path}")
+    for c in cams:
+        bpy.data.objects.remove(c, do_unlink=True)
 
 
 def setup_bloom(scene):
@@ -709,7 +1024,7 @@ def auto_exposure(scene, target, tmpdir):
     r.resolution_percentage = 20
     c.samples = 24
     r.image_settings.file_format = "OPEN_EXR"
-    path = os.path.join(tmpdir, "_exposure.exr")
+    path = os.path.join(tmpdir, f"_exposure_{os.getpid()}.exr")  # unique per parallel process
     r.filepath = path
     bpy.ops.render.render(write_still=True)
     img = bpy.data.images.load(path)
@@ -735,7 +1050,9 @@ def auto_exposure(scene, target, tmpdir):
             n = (x - 0.3320) / (0.1858 - y)
             cct = 449 * n ** 3 + 3525 * n ** 2 + 6823.3 * n + 5520.33
             cct = max(2500.0, min(12000.0, cct))
-            vs.white_balance_temperature = max(3200.0, min(9000.0, 0.75 * cct + 0.25 * 5200.0))
+            # Correct only part of the cast and keep interiors warm (client expectation);
+            # strongly blue daylight views are still pulled back toward neutral.
+            vs.white_balance_temperature = max(4600.0, min(6500.0, 0.35 * cct + 0.65 * 5200.0))
     r.resolution_percentage, c.samples, r.image_settings.file_format, r.filepath = saved
     return key, ev, getattr(vs, "white_balance_temperature", 6500)
 
@@ -767,6 +1084,10 @@ def parse_args():
     ap.add_argument("--time-budget", type=float, default=0,
                     help="seconds for the whole Blender stage; per-view time limits are derived")
     ap.add_argument("--no-portals", dest="portals", action="store_false")
+    ap.add_argument("--views-file", help="render exactly these planned views (parallel shard)")
+    ap.add_argument("--room-light", type=float, default=3.0, help="per-room ambient ceiling light, W/m2")
+    ap.add_argument("--no-room-lights", dest="room_lights", action="store_false")
+    ap.add_argument("--report", default="report.json", help="report file name inside --out")
     ap.add_argument("--no-bloom", dest="bloom", action="store_false")
     ap.add_argument("--no-auto-ceiling", dest="auto_ceiling", action="store_false",
                     help="don't add ceilings to rooms the model left open")
@@ -791,32 +1112,52 @@ def main():
     if opts.bloom:
         setup_bloom(scene)
 
-    views = [dict(s) for s in b.data["scenes"]]
-    rooms = []
-    if opts.auto_cameras == "always" or (opts.auto_cameras == "missing" and not views):
-        tp = time.time()
-        auto, rooms = b.auto_views(opts, os.path.join(opts.out, "plan.png"))
-        n_ceil = b.add_ceilings(rooms) if opts.auto_ceiling else 0
-        log(f"auto cameras: {len(auto)} views in {len(rooms)} rooms, {n_ceil} ceilings added "
-            f"({time.time() - tp:.1f}s)")
-        views += auto
-        for r in rooms:
-            r.pop("ceiling", None)
-    if not views:
-        views = [{"name": "Current view", "camera": b.data["model_camera"]}]
-    if opts.scenes != "all":
-        want = [w.strip() for w in opts.scenes.split(",")]
-        views = [v for i, v in enumerate(views) if v["name"] in want or str(i) in want]
-    if opts.max_views:
-        views = views[: opts.max_views]
-    with open(os.path.join(opts.out, "views.json"), "w") as f:
-        json.dump({"views": [{"name": v["name"], "auto": v.get("auto", False)} for v in views],
-                   "rooms": rooms}, f, indent=1)
-    if opts.plan_only:
-        return
+    if opts.views_file:
+        # Render shard: views (and generated ceilings) were planned by a separate process.
+        with open(opts.views_file) as f:
+            planned = json.load(f)
+        views = planned["views"]
+        if opts.auto_ceiling:
+            b.add_ceilings(planned.get("ceilings", []))
+        if opts.room_lights:
+            b.add_room_lights(planned.get("room_lights", []), opts.room_light)
+        if opts.fixture_lights:
+            log(f"under-cabinet strips: {b.add_strips(planned.get('strips', []))}")
+    else:
+        views = [dict(s) for s in b.data["scenes"]]
+        rooms = []
+        b.analyze_plan()
+        if opts.auto_cameras == "always" or (opts.auto_cameras == "missing" and not views):
+            tp = time.time()
+            auto, rooms = b.auto_views(opts, os.path.join(opts.out, "plan.png"))
+            log(f"auto cameras: {len(auto)} views in {len(rooms)} rooms ({time.time() - tp:.1f}s)")
+            views += auto
+        if not views:
+            views = [{"name": "Current view", "camera": b.data["model_camera"]}]
+        for i, v in enumerate(views):
+            v["index"] = i
+        if opts.scenes != "all":
+            want = [w.strip() for w in opts.scenes.split(",")]
+            views = [v for i, v in enumerate(views) if v["name"] in want or str(i) in want]
+        if opts.max_views:
+            views = views[: opts.max_views]
+        with open(os.path.join(opts.out, "views.json"), "w") as f:
+            json.dump({"views": [{"name": v["name"], "auto": v.get("auto", False)} for v in views],
+                       "rooms": rooms}, f, indent=1)
+        with open(os.path.join(opts.out, "views_full.json"), "w") as f:
+            plan = getattr(b, "plan", None)
+            json.dump({"views": views, "rooms": rooms or (plan.room_info() if plan else []),
+                       "ceilings": getattr(b, "ceiling_data", []),
+                       "room_lights": getattr(b, "room_light_data", []),
+                       "floor": plan.floor if plan else None, "strips": plan.strips if plan else []}, f)
+        if opts.plan_only:
+            if opts.save_blend:
+                save_editable_blend(b, views, opts)
+            log(f"planned {len(views)} views")
+            return
     log(f"setup done in {time.time() - t0:.1f}s; rendering {len(views)} views at {opts.width}x{height}")
-    if opts.save_blend:
-        bpy.ops.wm.save_as_mainfile(filepath=os.path.join(opts.out, "scene.blend"))
+    if opts.save_blend and not opts.views_file:
+        save_editable_blend(b, views, opts)
 
     report = []
     render_start = time.time()
@@ -839,18 +1180,18 @@ def main():
         if opts.mode == "day":
             # "Window pull": exterior brightness relative to the exposed interior.
             b.backdrop.inputs["Strength"].default_value = opts.window_brightness / (2 ** ev) / 0.75
-        fname = f"{i:02d}_{re.sub(r'[^A-Za-z0-9_-]+', '_', v['name'])}.png"
+        fname = f"{v.get('index', i):02d}_{re.sub(r'[^A-Za-z0-9_-]+', '_', v['name'])}.png"
         scene.render.filepath = os.path.join(opts.out, fname)
         bpy.ops.render.render(write_still=True)
         dt = time.time() - tv
-        log(f"view {i} '{v['name']}': clip={clip:.3f} key={key:.4f} ev={ev:+.2f} wb={wb:.0f}K {dt:.1f}s -> {fname}")
+        log(f"view {v.get('index', i)} '{v['name']}': clip={clip:.3f} key={key:.4f} ev={ev:+.2f} wb={wb:.0f}K {dt:.1f}s -> {fname}")
         report.append({"view": v["name"], "file": fname, "seconds": round(dt, 1), "exposure": round(ev, 2)})
         for ob in fill or []:
             bpy.data.objects.remove(ob, do_unlink=True)
-    exr = os.path.join(opts.out, "_exposure.exr")
+    exr = os.path.join(opts.out, f"_exposure_{os.getpid()}.exr")
     if os.path.exists(exr):
         os.remove(exr)
-    with open(os.path.join(opts.out, "report.json"), "w") as f:
+    with open(os.path.join(opts.out, opts.report), "w") as f:
         json.dump({"total_seconds": round(time.time() - t0, 1), "views": report}, f, indent=1)
     log(f"done in {time.time() - t0:.1f}s")
 

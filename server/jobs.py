@@ -72,21 +72,30 @@ class JobStore:
                                    (limit,)).fetchall()
         return [self._row(r) for r in rows]
 
-    def next_queued(self):
+    def claim(self):
+        """Atomically take the oldest queued job (safe with several worker threads)."""
         with self.lock:
             row = self.db.execute(f"SELECT {', '.join(FIELDS)} FROM jobs WHERE status='queued' "
                                   "ORDER BY created LIMIT 1").fetchone()
+            if row is None:
+                return None
+            self.db.execute("UPDATE jobs SET status='converting', stage='converting', started=? WHERE id=?",
+                            (time.time(), row[0]))
+            self.db.commit()
         return self._row(row)
 
 
 class Worker(threading.Thread):
-    def __init__(self, store):
-        super().__init__(daemon=True, name="render-worker")
+    """Runs one job at a time. Several workers run jobs concurrently; the GPU slot pool in
+    pipeline.py keeps the total number of Blender render processes within hardware limits."""
+
+    def __init__(self, store, n=0):
+        super().__init__(daemon=True, name=f"render-worker-{n}")
         self.store = store
 
     def run(self):
         while True:
-            job = self.store.next_queued()
+            job = self.store.claim()
             if job is None:
                 time.sleep(1.0)
                 continue

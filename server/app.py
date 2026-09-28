@@ -12,17 +12,24 @@ from server.jobs import JobStore, Worker
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 MAX_UPLOAD = 500 * 1024 * 1024
-SERVABLE = re.compile(r"^[\w .()-]+\.(png|jpg|json)$", re.I)
+SERVABLE = re.compile(r"^[\w .()-]+\.(png|jpg|json|blend)$", re.I)
 
 app = FastAPI(title="SketchUp Render")
 store = JobStore()
-worker = Worker(store)
+JOB_WORKERS = int(os.environ.get("SKP_JOB_WORKERS", "2"))
+workers = [Worker(store, i) for i in range(JOB_WORKERS)]
 
 
 @app.on_event("startup")
-def _start_worker():
-    if not worker.is_alive():
-        worker.start()
+def _start_workers():
+    for w in workers:
+        if not w.is_alive():
+            w.start()
+
+
+@app.get("/api/system")
+def system():
+    return {"gpus": pipeline.SLOTS.gpus, "gpu_slots": pipeline.SLOTS.size, "job_workers": JOB_WORKERS}
 
 
 def _public(job):
@@ -34,13 +41,15 @@ def _public(job):
 
 @app.post("/api/jobs")
 async def create_job(file: UploadFile = File(...), quality: str = Form("final"), mode: str = Form("day"),
-                     auto_cameras: str = Form("missing"), time_budget: float = Form(0)):
+                     auto_cameras: str = Form("missing"), time_budget: float = Form(0),
+                     save_blend: bool = Form(False)):
     if not file.filename.lower().endswith(".skp"):
         raise HTTPException(400, "Please upload a SketchUp .skp file")
     if quality not in pipeline.QUALITY or mode not in ("day", "night") or \
             auto_cameras not in ("missing", "always", "never"):
         raise HTTPException(400, "Invalid options")
-    options = {"quality": quality, "mode": mode, "auto_cameras": auto_cameras, "time_budget": time_budget}
+    options = {"quality": quality, "mode": mode, "auto_cameras": auto_cameras, "time_budget": time_budget,
+               "save_blend": save_blend}
     job_id = store.create(os.path.basename(file.filename), options)
     dest = os.path.join(store.job_dir(job_id), "input.skp")
     size = 0
@@ -72,7 +81,9 @@ def get_job(job_id: str):
     if not job:
         raise HTTPException(404, "Job not found")
     job = _public(job)
-    job["has_plan"] = os.path.exists(os.path.join(store.job_dir(job_id), "renders", "plan.png"))
+    rdir = os.path.join(store.job_dir(job_id), "renders")
+    job["has_plan"] = os.path.exists(os.path.join(rdir, "plan.png"))
+    job["has_blend"] = os.path.exists(os.path.join(rdir, "scene.blend"))
     return job
 
 

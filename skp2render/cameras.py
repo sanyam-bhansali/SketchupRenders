@@ -72,6 +72,30 @@ def floor_level(tris):
     return float(uniq[np.argmax(level_area)] * 0.05)
 
 
+def dominant_angle(tris, h):
+    """Main wall direction of the plan (radians in [0, pi/2)): SketchUp plans aren't always
+    axis-aligned, and views squared to the walls need the real wall direction."""
+    h = h + 1e-4
+    z = tris[:, :, 2]
+    t = tris[(z.min(1) < h) & (z.max(1) > h)].astype(np.float64)
+    if not len(t):
+        return 0.0
+    a, b = t, np.roll(t, -1, axis=1)
+    za, zb = a[..., 2], b[..., 2]
+    cross = (za - h) * (zb - h) < 0
+    s = np.where(cross, (h - za) / np.where(cross, zb - za, 1.0), 0.0)
+    p = a + s[..., None] * (b - a)
+    ok = cross.sum(1) == 2
+    p, cross = p[ok], cross[ok]
+    idx = np.argsort(~cross, axis=1, kind="stable")[:, :2]
+    d = p[np.arange(len(p)), idx[:, 1], :2] - p[np.arange(len(p)), idx[:, 0], :2]
+    L = np.linalg.norm(d, axis=1)
+    ang = np.mod(np.arctan2(d[:, 1], d[:, 0]), math.pi / 2)
+    hist, edges = np.histogram(ang, bins=90, range=(0, math.pi / 2), weights=L)
+    hist = hist + np.roll(hist, 1) + np.roll(hist, -1)
+    return float(edges[int(np.argmax(hist))] + (edges[1] - edges[0]) / 2)
+
+
 def slice_points(tris, h, step):
     """Sample points (x, y) along the intersection of triangles with plane z = h."""
     h = h + 1e-4
@@ -176,12 +200,16 @@ def distance_to_wall(room):
 
 def cast_rays(origins, angles, blocked, furniture, cell, detail, max_dist=14.0):
     """2D ray march. Returns (distance m, furniture cells passed, detail at hit) per ray."""
-    R, A = len(origins), len(angles)
+    angles = np.asarray(angles, np.float64)
+    R = len(origins)
+    if angles.ndim == 1:                        # same fan for every origin
+        angles = np.broadcast_to(angles, (R, len(angles)))
+    A = angles.shape[1]
     step = 0.5
     nsteps = int(max_dist / cell / step)
     o = np.repeat(origins[:, None, :], A, 1).reshape(-1, 2).astype(np.float64)
-    d = np.stack([np.cos(angles), np.sin(angles)], 1)
-    d = np.tile(d, (R, 1)) * step
+    a = angles.reshape(-1)
+    d = np.stack([np.cos(a), np.sin(a)], 1) * step
     dist = np.full(len(o), nsteps, np.float64)
     furn = np.zeros(len(o), np.int32)
     det = np.zeros(len(o), np.float32)
@@ -206,6 +234,47 @@ def cast_rays(origins, angles, blocked, furniture, cell, detail, max_dist=14.0):
         alive[idx[hit]] = False
     return ((dist * step * cell).reshape(R, A), furn.reshape(R, A), det.reshape(R, A),
             (first_furn * step * cell).reshape(R, A))
+
+
+def under_cabinet_strips(tris, nrm, tri_area, floor, grid):
+    """Where a wall-cabinet underside (1.3-1.85 m) hangs over a counter (0.8-1.0 m), return
+    LED strip placements. Works on raw geometry, so it doesn't matter how the kitchen is grouped."""
+    horiz = np.abs(nrm[:, 2]) > 0.98 * (2 * tri_area + 1e-12)
+    zc = tris[:, :, 2].mean(1) - floor
+
+    def mask(sel):
+        m = np.zeros(grid.shape, bool)
+        t = tris[sel]
+        lo = ((t[:, :, :2].min(1) - grid.lo) / grid.cell).astype(np.int64)
+        hi = ((t[:, :, :2].max(1) - grid.lo) / grid.cell).astype(np.int64) + 1
+        for (c0, r0), (c1, r1) in zip(lo, hi):
+            if (c1 - c0) * (r1 - r0) < 40000:
+                m[max(r0, 0):max(r1, 0), max(c0, 0):max(c1, 0)] = True
+        return m
+
+    under = mask(horiz & (nrm[:, 2] < 0) & (zc > 1.3) & (zc < 1.85))
+    counter = mask(horiz & (nrm[:, 2] > 0) & (zc > 0.8) & (zc < 1.0))
+    both = under & counter
+    lab, n = label(both)
+    out = []
+    for k in range(1, n + 1):
+        rr, cc = np.nonzero(lab == k)
+        if len(rr) * grid.cell ** 2 < 0.08:
+            continue
+        lo = grid.lo + np.array([cc.min(), rr.min()]) * grid.cell
+        hi = grid.lo + np.array([cc.max() + 1, rr.max() + 1]) * grid.cell
+        size = hi - lo
+        if size.max() < 0.35:
+            continue
+        sel = horiz & (nrm[:, 2] < 0) & (zc > 1.3) & (zc < 1.85)
+        cz = tris[sel, :, 2].mean(1)
+        cxy = tris[sel, :, :2].mean(1)
+        inside = (cxy[:, 0] >= lo[0]) & (cxy[:, 0] <= hi[0]) & (cxy[:, 1] >= lo[1]) & (cxy[:, 1] <= hi[1])
+        z = float(np.median(cz[inside])) if inside.any() else floor + 1.45
+        c = (lo + hi) / 2
+        out.append({"centre": [float(c[0]), float(c[1]), z - 0.015], "along_x": bool(size[0] >= size[1]),
+                    "length": float(size.max() * 0.92)})
+    return out
 
 
 def largest_patch(tris, grid, room_mask):
@@ -234,9 +303,8 @@ def room_type(names):
     return best if counts[best] else "Room"
 
 
-def plan_views(tris, occ_centres, aspect=16 / 9, cell=0.06, eye=1.3, hfov=78.0, max_views_per_room=2,
-               log=print, plan_png=None):
-    """Return (views, rooms) with SketchUp-style camera dicts."""
+def analyze(tris, occ_centres, cell=0.06, eye=1.3, log=print):
+    """Find the floor, rooms, room types and ceiling heights. Returns a Plan (or None)."""
     floor = floor_level(tris)
     step = cell * 0.5
     eye_cut = slice_points(tris, floor + eye, step)
@@ -244,7 +312,8 @@ def plan_views(tris, occ_centres, aspect=16 / 9, cell=0.06, eye=1.3, hfov=78.0, 
     low_cut = slice_points(tris, floor + 0.5, step)
     if len(eye_cut) < 50:
         log("  auto-cameras: no walls found at eye height")
-        return [], []
+        return None
+    axis = dominant_angle(tris, floor + eye)
     grid = Grid(eye_cut, cell)
     cell = grid.cell
     walls_eye = dilate(grid.raster(eye_cut), 1)
@@ -357,6 +426,7 @@ def plan_views(tris, occ_centres, aspect=16 / 9, cell=0.06, eye=1.3, hfov=78.0, 
         vert_sel = vlab == rm["id"]
         top = vtop[vert_sel]
         rm["ceiling_z"] = floor + float(np.clip(np.percentile(top, 90) if len(top) else 2.9, 2.4, 3.8))
+    all_rooms = list(rooms)                      # every room gets light, even empty ones
     rooms = [r for r in rooms if r["content"] >= 8 or r["area"] >= 8]
     rest = [r for r in rooms if r["type"] == "Room" and r["area"] >= 10]
     if rest and not any(r["type"] == "Living" for r in rooms):
@@ -371,75 +441,191 @@ def plan_views(tris, occ_centres, aspect=16 / 9, cell=0.06, eye=1.3, hfov=78.0, 
         seen[t] = seen.get(t, 0) + 1
         rm["name"] = t if counts[t] == 1 else f"{t} {seen[t]}"
 
-    # Camera placement.
-    angles = np.radians(np.arange(0, 360, 2.0))
-    views = []
-    blocked = walls_eye | walls
-    for rm in rooms:
-        r0, r1, c0, c1 = rm["box"]
-        dist = rm["dist"]
+    log(f"  auto-cameras: floor z={floor:.2f} m, plan axis {math.degrees(axis):.0f} deg, "
+        f"{len(rooms)} rooms with content")
+    for r in all_rooms:
+        r.setdefault("name", r.get("type", "Room"))
+    strips = under_cabinet_strips(tris, nrm, tri_area, floor, grid)
+    return Plan(grid=grid, floor=floor, eye=eye, axis=axis, lab=lab, walls=walls, walls_eye=walls_eye,
+                furniture=furniture, detail=detail, rooms=rooms, all_rooms=all_rooms, strips=strips)
+
+
+class Plan:
+    """Rooms of one floor plus everything needed to propose and pick camera views."""
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+        self.cell = self.grid.cell
+
+    # ---------------------------------------------------------------- ceilings / info
+    def ceilings(self):
+        out = []
+        for r in self.all_rooms:
+            if not r["has_ceiling"]:
+                out.append({"room": r["name"],
+                            **ceiling_mesh(dilate(r["mask"], 3) & ~(self.lab > 0) | r["mask"], self.grid,
+                                           r["ceiling_z"])})
+        return out
+
+    def room_lights(self):
+        """One soft ceiling light rectangle per room (centre, size) just under the ceiling."""
+        out = []
+        for r in self.all_rooms:
+            rr, cc = np.nonzero(r["mask"])
+            lo = self.to_world([cc.min(), rr.min()])
+            hi = self.to_world([cc.max() + 1, rr.max() + 1])
+            size = np.maximum((hi - lo) * 0.6, 0.4)
+            c = (lo + hi) / 2
+            out.append({"room": r["name"], "centre": [float(c[0]), float(c[1]), r["ceiling_z"] - 0.04],
+                        "size": [float(size[0]), float(size[1])]})
+        return out
+
+    def room_info(self):
+        return [{"name": r["name"], "type": r["type"], "area_m2": round(r["area"], 1),
+                 "has_ceiling": r["has_ceiling"], "cues": r.get("cues")} for r in self.rooms]
+
+    def write_png(self, path):
+        write_plan(path, self.walls, self.furniture, self.rooms)
+
+    # ---------------------------------------------------------------- candidates
+    def to_world(self, cells_xy):
+        return self.grid.lo + np.asarray(cells_xy, np.float64) * self.cell
+
+    def to_cells(self, xy):
+        return (np.asarray(xy, np.float64) - self.grid.lo) / self.cell
+
+    def free(self, rm, xy, margin=0.2):
+        """Camera position is inside the room, off walls/tall furniture, with some clearance."""
+        c, r = self.to_cells(xy).astype(int)
+        H, W = self.walls.shape
+        if not (0 <= r < H and 0 <= c < W) or not rm["mask"][r, c]:
+            return False
+        k = max(1, int(margin / self.cell))
+        return not self.walls_eye[max(r - k, 0):r + k + 1, max(c - k, 0):c + k + 1].any()
+
+    def candidates(self, rm):
+        """Hero (one-point, squared to a wall) and corner (two-point diagonal) proposals."""
+        rr, cc = np.nonzero(rm["mask"])
+        P = self.to_world(np.stack([cc + 0.5, rr + 0.5], 1))
+        ring = dilate(rm["mask"], 3) & self.walls
+        wr, wc = np.nonzero(ring)
+        WP = self.to_world(np.stack([wc + 0.5, wr + 0.5], 1))
+        wdet = self.detail[wr, wc] + 0.05
         small = rm["area"] < 7.0
-        fov = 95.0 if small else hfov
-        lo_d, hi_d = (0.25, 0.6) if small else (0.35, 0.9)
-        cand = np.argwhere((dist * cell >= lo_d) & (dist * cell <= hi_d) & ~walls_eye[r0:r1, c0:c1])
-        if not len(cand):
-            cand = np.argwhere(dist == dist.max())
-        stride = max(1, len(cand) // 160)
-        cand = cand[::stride]
-        origins = np.stack([cand[:, 1] + c0 + 0.5, cand[:, 0] + r0 + 0.5], 1)
-        d, f, det, ff = cast_rays(origins, angles, blocked, furniture, cell, detail)
-        half = int(round(fov / 2 / 2.0))
-        best = []
-        for ai in range(0, len(angles), 5):   # 10 degree view directions
-            win = [(ai + j) % len(angles) for j in range(-half, half + 1)]
-            dd = np.minimum(d[:, win], 12.0)
-            area = 0.5 * (dd ** 2).sum(1) * math.radians(2.0)
-            area_n = np.minimum(area / rm["area"], 1.3)
-            furn_n = np.minimum(f[:, win].sum(1) * cell / max(math.sqrt(rm["area"]), 1.0) / 8.0, 1.0)
-            det_n = det[:, win].mean(1)
-            centre = d[:, ai]
-            depth_n = np.minimum(centre, 6.0) / 6.0
-            # Coverage, what's in it (furniture, feature walls), depth; never face a wall up close.
-            # Furniture right in front of the lens (bed filling the foreground) spoils the shot.
-            mid = [(ai + j) % len(angles) for j in range(-half // 2, half // 2 + 1)]
-            crowd = (ff[:, mid] < 0.9).mean(1)
-            score = (0.8 * area_n + 0.45 * furn_n + 0.6 * det_n + 0.2 * depth_n
-                     - 1.0 * (centre < 1.2) - 0.6 * crowd)
-            i = int(np.argmax(score))
-            best.append((float(score[i]), i, ai))
-        best.sort(reverse=True)
-        chosen = []
-        for s, i, ai in best:
-            if len(chosen) >= (1 if small else max_views_per_room):
-                break
-            if chosen:
-                s0, i0, a0 = chosen[0]
-                dang = abs((ai - a0 + len(angles) / 2) % len(angles) - len(angles) / 2) * 2.0
-                sep = np.linalg.norm(origins[i] - origins[i0]) * cell
-                if dang < 100 or sep < 1.2 or s < 0.65 * s0:
-                    continue
-            chosen.append((s, i, ai))
-        for vi, (s, i, ai) in enumerate(chosen):
-            x, y = grid.lo + origins[i] * cell
-            a = angles[ai]
-            e = [float(x), float(y), floor + eye]
-            t = [float(x + math.cos(a) * 5), float(y + math.sin(a) * 5), floor + eye]
-            vfov = math.degrees(2 * math.atan(math.tan(math.radians(fov) / 2) / aspect))
-            suffix = "" if len(chosen) == 1 else f" - View {chr(65 + vi)}"
-            views.append({"name": rm["name"] + suffix, "auto": True, "room": rm["name"], "score": round(s, 2),
-                          "camera": {"eye": e, "target": t, "up": [0, 0, 1], "perspective": True,
-                                     "fov": vfov, "fov_is_height": True, "aspect": None}})
-            rm.setdefault("cams", []).append((origins[i], a, fov))
-    if plan_png:
-        write_plan(plan_png, walls, furniture, rooms)
-    info = []
-    for r in rooms:
-        item = {"name": r["name"], "type": r["type"], "area_m2": round(r["area"], 1),
-                "has_ceiling": r["has_ceiling"], "cues": r.get("cues")}
-        if not r["has_ceiling"]:
-            item["ceiling"] = ceiling_mesh(dilate(r["mask"], 3) & ~(lab > 0) | r["mask"], grid, r["ceiling_z"])
-        info.append(item)
-    return views, info
+        out = []
+        for k in range(4):
+            h = self.axis + k * math.pi / 2
+            u, v = np.array([math.cos(h), math.sin(h)]), np.array([-math.sin(h), math.cos(h)])
+            s, t = P @ u, P @ v
+            back, front = np.percentile(s, 1), np.percentile(s, 99)
+            depth = front - back
+            if depth < 1.8:
+                continue
+            band = s > front - 0.6
+            width = np.percentile(t[band], 98) - np.percentile(t[band], 2) if band.sum() > 3 else np.ptp(t)
+            fw = (WP @ u) > front - 0.05                     # cells of the wall we're facing
+            tc = float(np.average((WP @ v)[fw], weights=wdet[fw])) if fw.any() else float(np.median(t))
+            tc = float(np.clip(tc, np.percentile(t, 10), np.percentile(t, 90)))
+            for back_off in (0.28, min(0.5, 0.15 * depth), 0.9):
+                for dt in (0.0, -0.18 * width, 0.18 * width):
+                    xy = (back + back_off) * u + (tc + dt) * v
+                    if not self.free(rm, xy):
+                        continue
+                    D = front - (back + back_off)
+                    hf = math.degrees(2 * math.atan((width / 2 + 0.25) / max(D, 0.5)))
+                    out.append({"kind": "front", "xy": xy, "heading": h, "hfov": float(np.clip(hf, 66, 96))})
+        # Corner / diagonal views: near-wall spots, looking across the room.
+        dist = rm["dist"]
+        r0, r1, c0, c1 = rm["box"]
+        lo_d, hi_d = (0.25, 0.6) if small else (0.35, 0.8)
+        cand = np.argwhere((dist * self.cell >= lo_d) & (dist * self.cell <= hi_d))
+        stride = max(1, len(cand) // 60)
+        centroid = P.mean(0)
+        for rc in cand[::stride]:
+            xy = self.to_world([rc[1] + c0 + 0.5, rc[0] + r0 + 0.5])
+            if not self.free(rm, xy, 0.2):
+                continue
+            base = math.atan2(*(centroid - xy)[::-1])       # towards the room centre
+            for dh in (-0.45, -0.2, 0.0, 0.2, 0.45):
+                out.append({"kind": "corner", "xy": xy, "heading": base + dh, "hfov": 90.0 if small else 76.0})
+        return out
+
+    def prescore(self, rm, cands):
+        """Cheap 2D score (coverage, furniture, feature walls, obstruction) for ranking."""
+        if not cands:
+            return np.zeros(0)
+        blocked = self.walls_eye | self.walls
+        origins = np.array([self.to_cells(c["xy"]) for c in cands])
+        headings = np.array([c["heading"] for c in cands])
+        hf = np.radians([c["hfov"] for c in cands])
+        offs = np.linspace(-0.5, 0.5, 31)
+        angles = (headings[:, None] + offs[None, :] * hf[:, None])       # (N, 31)
+        d, f, det, ff = cast_rays(origins, angles, blocked, self.furniture, self.cell, self.detail)
+        area = 0.5 * (np.minimum(d, 12) ** 2).sum(1) * (hf / 30)
+        area_n = np.minimum(area / rm["area"], 1.3)
+        furn_n = np.minimum(f.sum(1) * self.cell / max(math.sqrt(rm["area"]), 1) / 8, 1)
+        centre = d[:, 15]
+        return (0.8 * area_n + 0.45 * furn_n + 0.6 * det.mean(1) + 0.2 * np.minimum(centre, 6) / 6
+                - 1.0 * (centre < 1.2) - 0.6 * (ff[:, 10:21] < 0.9).mean(1))
+
+    def camera(self, rm, c, aspect):
+        eye_h = 1.4 if rm["type"] == "Bathroom" else 1.25
+        x, y = c["xy"]
+        z = self.floor + eye_h
+        h = c["heading"]
+        vfov = math.degrees(2 * math.atan(math.tan(math.radians(c["hfov"]) / 2) / aspect))
+        return {"eye": [float(x), float(y), z], "target": [float(x + math.cos(h) * 5), float(y + math.sin(h) * 5), z],
+                "up": [0, 0, 1], "perspective": True, "fov": vfov, "fov_is_height": True, "aspect": None}
+
+    # ---------------------------------------------------------------- selection
+    def choose_views(self, aspect=16 / 9, scorer=None, max_per_room=2, top_k=18, log=print):
+        """Rank candidates in 2D, re-score the best ones with the 3D scorer, pick diverse views.
+
+        scorer(list_of_camera_dicts) -> list of (score, set_of_object_ids)
+        """
+        views = []
+        for rm in self.rooms:
+            cands = self.candidates(rm)
+            if not cands:
+                continue
+            pre = self.prescore(rm, cands)
+            order = np.argsort(-pre)
+            # Keep the best of each kind so both view types reach the 3D stage.
+            picked = [i for i in order if cands[i]["kind"] == "front"][:top_k // 3]
+            picked += [i for i in order if i not in picked][:top_k - len(picked)]
+            cams = [self.camera(rm, cands[i], aspect) for i in picked]
+            if scorer:
+                s3 = scorer(cams)
+            else:
+                s3 = [(0.0, set()) for _ in picked]
+            pmax = max(float(pre[picked].max()), 1e-6)
+            total = [0.35 * pre[i] / pmax + s for i, (s, _) in zip(picked, s3)]
+            ranked = sorted(range(len(picked)), key=lambda j: -total[j])
+            limit = 1 if rm["area"] < 7.0 else max_per_room
+            chosen = []
+            for j in ranked:
+                if len(chosen) >= limit:
+                    break
+                if chosen:
+                    j0 = chosen[0]
+                    c0, c1 = cands[picked[j0]], cands[picked[j]]
+                    dh = abs((c1["heading"] - c0["heading"] + math.pi) % (2 * math.pi) - math.pi)
+                    sep = float(np.linalg.norm(np.array(c1["xy"]) - np.array(c0["xy"])))
+                    o0, o1 = s3[j0][1], s3[j][1]
+                    overlap = len(o0 & o1) / max(len(o0 | o1), 1)
+                    if total[j] < 0.7 * total[j0] or (dh < math.radians(60) and sep < 1.5) or overlap > 0.8:
+                        continue
+                chosen.append(j)
+            label_kind = {"front": "Front", "corner": "Corner"}
+            for n_, j in enumerate(chosen):
+                c = cands[picked[j]]
+                suffix = f" - {label_kind[c['kind']]}" if len(chosen) > 1 else ""
+                if len(chosen) > 1 and n_ == 1 and cands[picked[chosen[0]]]["kind"] == c["kind"]:
+                    suffix = f" - {label_kind[c['kind']]} 2"
+                views.append({"name": rm["name"] + suffix, "auto": True, "room": rm["name"], "kind": c["kind"],
+                              "score": round(float(total[j]), 2), "camera": cams[j]})
+                rm.setdefault("cams", []).append((self.to_cells(c["xy"]), c["heading"], c["hfov"]))
+        return views
 
 
 def ceiling_mesh(mask, grid, z):
