@@ -23,6 +23,8 @@ def main():
     ap.add_argument("--auto-cameras", choices=["missing", "always", "never"], default="missing")
     ap.add_argument("--time-budget", type=float, default=0, help="seconds for the whole job")
     ap.add_argument("--aspect", type=float, default=16 / 9)
+    ap.add_argument("--no-model-lights", dest="model_lights", action="store_false",
+                    help="ignore the model's own light data (e.g. Enscape lights)")
     a = ap.parse_args()
 
     name = re.sub(r"[^A-Za-z0-9_-]+", "_", os.path.splitext(os.path.basename(a.skp))[0]).strip("_")
@@ -42,7 +44,7 @@ def main():
     try:
         report = pipeline.run(a.skp, out, work, {"quality": a.quality, "scenes": a.scenes, "mode": a.mode,
                                                   "auto_cameras": a.auto_cameras, "time_budget": a.time_budget,
-                                                  "aspect": a.aspect}, on_event)
+                                                  "aspect": a.aspect, "model_lights": a.model_lights}, on_event)
     except pipeline.PipelineError as e:
         sys.exit(str(e))
     print(f"done: {len(report['views'])} views in {report['total_seconds']:.0f}s -> {out}")

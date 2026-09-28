@@ -32,7 +32,7 @@ QUALITY = {
 }
 
 DEFAULTS = {"quality": "final", "mode": "day", "scenes": "all", "auto_cameras": "missing",
-            "time_budget": 0, "aspect": 16 / 9, "parallel": 0, "save_blend": False}
+            "time_budget": 0, "aspect": 16 / 9, "parallel": 0, "save_blend": False, "model_lights": True}
 
 _VIEW_RE = re.compile(r"\[build\] view (\d+) '(.+)': .* ([\d.]+)s -> (\S+\.png)")
 _TOTAL_RE = re.compile(r"rendering (\d+) views")
@@ -110,6 +110,8 @@ def run(skp, out_dir, work_dir, options=None, on_event=None):
     q = QUALITY[opts["quality"]]
     common = ["--package", work_dir, "--out", out_dir, "--width", str(q["width"]), "--samples", str(q["samples"]),
               "--mode", opts["mode"], "--aspect", str(opts["aspect"])]
+    if not opts.get("model_lights", True):
+        common.append("--no-model-lights")
     lock = threading.Lock()
 
     def on_line(line):

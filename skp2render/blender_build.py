@@ -233,8 +233,9 @@ class Builder:
             light = d.get("light")
             xf = Matrix(occ["xf"])
             if light:
-                self.add_enscape_light(light, xf, f"{d['name']}_{i}", occ)
-                n += 1
+                if self.opts.model_lights:     # designer's Enscape lights (can be switched off)
+                    self.add_enscape_light(light, xf, f"{d['name']}_{i}", occ)
+                    n += 1
             elif self.opts.fixture_lights:
                 if self.add_fixture_light(d, xf, f"{d['name']}_{i}", occ):
                     n += 1
@@ -804,13 +805,29 @@ class Builder:
 
 
 def kelvin_to_rgb(k):
-    """Approximate blackbody colour (Tanner Helland fit), normalised."""
-    t = k / 100.0
-    r = 255 if t <= 66 else 329.698727446 * ((t - 60) ** -0.1332047592)
-    g = 99.4708025861 * math.log(t) - 161.1195681661 if t <= 66 else 288.1221695283 * ((t - 60) ** -0.0755148492)
-    b = 255 if t >= 66 else (0 if t <= 19 else 138.5177312231 * math.log(t - 10) - 305.0447927307)
-    c = [max(0, min(255, v)) / 255 for v in (r, g, b)]
-    return tuple((v ** 2.2) for v in c)
+    """Blackbody colour on the Planckian locus (Kim et al. fit), as linear Rec.709, max = 1.
+
+    Must match the locus Blender's white balance uses; the old sRGB-curve approximation was
+    low in green, and white-balancing it turned warm-lit white walls pink.
+    """
+    t = max(1667.0, min(25000.0, float(k)))
+    if t <= 4000:
+        x = -0.2661239e9 / t ** 3 - 0.2343589e6 / t ** 2 + 0.8776956e3 / t + 0.179910
+    else:
+        x = -3.0258469e9 / t ** 3 + 2.1070379e6 / t ** 2 + 0.2226347e3 / t + 0.240390
+    if t <= 2222:
+        y = -1.1063814 * x ** 3 - 1.34811020 * x ** 2 + 2.18555832 * x - 0.20219683
+    elif t <= 4000:
+        y = -0.9549476 * x ** 3 - 1.37418593 * x ** 2 + 2.09137015 * x - 0.16748867
+    else:
+        y = 3.0817580 * x ** 3 - 5.87338670 * x ** 2 + 3.75112997 * x - 0.37001483
+    X, Y, Z = x / y, 1.0, (1 - x - y) / y
+    r = 3.2406 * X - 1.5372 * Y - 0.4986 * Z
+    g = -0.9689 * X + 1.8758 * Y + 0.0415 * Z
+    b = 0.0557 * X - 0.2040 * Y + 1.0570 * Z
+    rgb = [max(v, 0.0) for v in (r, g, b)]
+    m = max(rgb)
+    return tuple(v / m for v in rgb)
 
 
 # --------------------------------------------------------------------------- cameras
@@ -1077,6 +1094,8 @@ def parse_args():
     ap.add_argument("--fill", type=float, default=6.0, help="room fill W/m^2 (0 disables)")
     ap.add_argument("--exposure-target", type=float, default=0.36)
     ap.add_argument("--no-fixture-lights", dest="fixture_lights", action="store_false")
+    ap.add_argument("--no-model-lights", dest="model_lights", action="store_false",
+                    help="ignore light data stored in the model (e.g. Enscape lights)")
     ap.add_argument("--save-blend", action="store_true")
     ap.add_argument("--auto-cameras", choices=["missing", "always", "never"], default="missing",
                     help="generate room cameras when the model has no scenes (or always)")

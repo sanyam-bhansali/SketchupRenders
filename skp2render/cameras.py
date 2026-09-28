@@ -410,10 +410,10 @@ def analyze(tris, occ_centres, cell=0.06, eye=1.3, log=print):
             table = largest_patch(tris[up][sel & (hz > 0.70) & (hz < 0.80)], grid, rm["mask"])
             rm["cues"] = {"bed_patch_m2": round(bed, 2), "table_m2": round(table, 2),
                           "counter_m2": round(float(counter), 2)}
-            if rm["area"] < 4.5:
-                t = "Bathroom" if bed < 1.0 else "Room"
-            elif counter > 1.0 and counter > bed:
+            if counter > 0.6 and counter > bed:        # before the small-room rule: kitchens are small too
                 t = "Kitchen"
+            elif rm["area"] < 4.5:
+                t = "Bathroom" if bed < 1.0 else "Room"
             elif bed >= 2.6 or (bed >= 1.2 and table < 0.9):
                 t = "Bedroom"
             elif table >= 0.9 and rm["area"] >= 12:
@@ -601,27 +601,34 @@ class Plan:
             pmax = max(float(pre[picked].max()), 1e-6)
             total = [0.35 * pre[i] / pmax + s for i, (s, _) in zip(picked, s3)]
             ranked = sorted(range(len(picked)), key=lambda j: -total[j])
-            limit = 1 if rm["area"] < 7.0 else max_per_room
+            limit = 1 if rm["area"] < 7.0 else (max_per_room + 1 if rm["area"] >= 14.0 else max_per_room)
             chosen = []
             for j in ranked:
                 if len(chosen) >= limit:
                     break
-                if chosen:
-                    j0 = chosen[0]
+                if chosen and total[j] < 0.7 * total[chosen[0]]:
+                    continue
+
+                def too_similar(j0):
                     c0, c1 = cands[picked[j0]], cands[picked[j]]
                     dh = abs((c1["heading"] - c0["heading"] + math.pi) % (2 * math.pi) - math.pi)
                     sep = float(np.linalg.norm(np.array(c1["xy"]) - np.array(c0["xy"])))
                     o0, o1 = s3[j0][1], s3[j][1]
                     overlap = len(o0 & o1) / max(len(o0 | o1), 1)
-                    if total[j] < 0.7 * total[j0] or (dh < math.radians(60) and sep < 1.5) or overlap > 0.8:
-                        continue
+                    return (dh < math.radians(60) and sep < 1.5) or overlap > 0.8
+
+                if any(too_similar(j0) for j0 in chosen):
+                    continue
                 chosen.append(j)
             label_kind = {"front": "Front", "corner": "Corner"}
-            for n_, j in enumerate(chosen):
+            kind_count = {}
+            for j in chosen:
                 c = cands[picked[j]]
-                suffix = f" - {label_kind[c['kind']]}" if len(chosen) > 1 else ""
-                if len(chosen) > 1 and n_ == 1 and cands[picked[chosen[0]]]["kind"] == c["kind"]:
-                    suffix = f" - {label_kind[c['kind']]} 2"
+                kind_count[c["kind"]] = kind_count.get(c["kind"], 0) + 1
+                n_kind = kind_count[c["kind"]]
+                suffix = ""
+                if len(chosen) > 1:
+                    suffix = f" - {label_kind[c['kind']]}" + (f" {n_kind}" if n_kind > 1 else "")
                 views.append({"name": rm["name"] + suffix, "auto": True, "room": rm["name"], "kind": c["kind"],
                               "score": round(float(total[j]), 2), "camera": cams[j]})
                 rm.setdefault("cams", []).append((self.to_cells(c["xy"]), c["heading"], c["hfov"]))
