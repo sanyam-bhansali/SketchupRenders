@@ -35,7 +35,7 @@ def main():
         elif kind == "plan":
             print(f"  {d['views']} views to render")
         elif kind == "view":
-            print(f"  ✓ {d['name']}  ({d['seconds']:.0f}s) -> {d['file']}")
+            print(f"  done: {d['name']}  ({d['seconds']:.0f}s) -> {d['file']}")
         elif kind == "log" and ("auto cameras" in d["line"] or "Error" in d["line"]):
             print("   ", d["line"])
 

@@ -43,20 +43,24 @@ class PipelineError(RuntimeError):
     pass
 
 
-def _gpu_count():
+def _gpu_info():
+    """(gpu count, smallest VRAM in GB) from nvidia-smi; (1, 8) if unavailable."""
     try:
-        out = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10).stdout
-        return max(1, sum(1 for l in out.splitlines() if l.startswith("GPU ")))
-    except (OSError, subprocess.SubprocessError):
-        return 1
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=10).stdout
+        mem = [int(l.strip()) for l in out.splitlines() if l.strip().isdigit()]
+        return (len(mem), min(mem) / 1024) if mem else (1, 8.0)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 1, 8.0
 
 
 class SlotPool:
     """Hardware slots for Blender render processes: (slot id, gpu index)."""
 
     def __init__(self):
-        gpus = _gpu_count()
-        per_gpu = int(os.environ.get("SKP_SLOTS_PER_GPU", "2"))
+        gpus, vram_gb = _gpu_info()
+        # A large interior scene needs ~3-5 GB per Blender process; allow one process per ~10 GB.
+        per_gpu = int(os.environ.get("SKP_SLOTS_PER_GPU", str(max(1, int(vram_gb // 10)))))
         total = int(os.environ.get("SKP_GPU_SLOTS", str(gpus * per_gpu)))
         self.gpus, self.size = gpus, max(1, total)
         self.q = queue.Queue()
@@ -141,9 +145,9 @@ def run(skp, out_dir, work_dir, options=None, on_event=None):
     budget = None
     if opts.get("time_budget"):
         budget = max(30.0, float(opts["time_budget"]) - (time.time() - t0))
-    errors, reports = [], []
+    errors, reports, retry = [], [], []
 
-    def run_shard(k, shard_views):
+    def run_shard(k, shard_views, final=False):
         path = os.path.join(out_dir, f"_shard{k}.json")
         with open(path, "w") as f:
             json.dump({"views": shard_views, "ceilings": planned.get("ceilings", []),
@@ -158,19 +162,34 @@ def run(skp, out_dir, work_dir, options=None, on_event=None):
         finally:
             SLOTS.release(slot)
         if code != 0:
+            text = "\n".join(tail)
+            if not final and re.search(r"out of memory|OPTIX_ERROR|CUDA", text, re.I):
+                retry.append((k, shard_views))     # GPU busy/full: run again once others finish
+                return
             errors.append(f"shard {k}:\n" + "\n".join(tail[-12:]))
             return
         with open(os.path.join(out_dir, f"_report{k}.json")) as f:
             reports.append(json.load(f))
         os.remove(path)
 
-    threads = [threading.Thread(target=run_shard, args=(k, s)) for k, s in enumerate(shards)]
+    def guarded(k, s):
+        try:
+            run_shard(k, s)
+        except Exception as e:  # never let a shard fail silently (job would look "done")
+            errors.append(f"shard {k}: {type(e).__name__}: {e}")
+
+    threads = [threading.Thread(target=guarded, args=(k, s)) for k, s in enumerate(shards)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
-    if errors:
-        raise PipelineError("Render stage failed:\n" + "\n\n".join(errors))
+    for k, shard_views in retry:                   # sequential, with the GPU to itself
+        emit("log", line=f"[pipeline] retrying shard {k} after GPU memory error")
+        done = {os.path.basename(v["file"]) for r in reports for v in r["views"]}
+        remaining = [v for v in shard_views if not any(f.startswith(f"{v.get('index', 0):02d}_") for f in done)]
+        run_shard(k, remaining or shard_views, final=True)
+    if errors or not reports:
+        raise PipelineError("Render stage failed:\n" + ("\n\n".join(errors) or "no views were rendered"))
     t2 = time.time()
 
     all_views = sorted((v for r in reports for v in r["views"]), key=lambda v: v["file"])
