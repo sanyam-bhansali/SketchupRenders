@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SketchUp Render Studio</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1c1a; --muted: #6f6b64; --line: #e6e3dd;
+    --accent: #b8742f; --accent-ink: #ffffff; --ok: #2f8a57; --bad: #b3413a; --track: #eeeae3;
+    --shadow: 0 1px 2px rgba(0,0,0,.05), 0 4px 16px rgba(0,0,0,.04);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #151413; --panel: #1f1d1b; --ink: #f1eee9; --muted: #a39e96; --line: #2f2c29;
+            --accent: #d99550; --accent-ink: #1a1208; --track: #2b2825; --shadow: none; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 18px 28px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  header .dot { width: 22px; height: 22px; border-radius: 6px; background: linear-gradient(135deg, var(--accent), #e8c38f); }
+  header .sub { color: var(--muted); margin-left: auto; font-size: 13px; }
+  main { display: grid; grid-template-columns: 340px 1fr; gap: 24px; padding: 24px 28px; max-width: 1600px; margin: 0 auto; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 16px; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 12px; font-weight: 600; }
+  .pad { padding: 18px; }
+  #drop { border: 1.5px dashed var(--line); border-radius: 10px; padding: 26px 12px; text-align: center; cursor: pointer;
+          transition: border-color .15s, background .15s; }
+  #drop.over, #drop:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 6%, transparent); }
+  #drop strong { display: block; font-size: 15px; margin-bottom: 4px; }
+  #drop span { color: var(--muted); font-size: 13px; }
+  #drop .file { margin-top: 10px; font-weight: 600; color: var(--accent); word-break: break-all; }
+  .opts { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 14px 0; }
+  label.f { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); min-width: 0; }
+  select, input[type=number] { width: 100%; min-width: 0; font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line);
+                               border-radius: 8px; padding: 7px 8px; }
+  button.primary { width: 100%; border: 0; border-radius: 9px; padding: 11px; font: inherit; font-weight: 600;
+                   background: var(--accent); color: var(--accent-ink); cursor: pointer; }
+  button.primary:disabled { opacity: .45; cursor: default; }
+  .jobs { margin-top: 18px; }
+  .job { display: block; width: 100%; text-align: left; font: inherit; color: inherit; background: none; border: 0;
+         border-top: 1px solid var(--line); padding: 12px 18px; cursor: pointer; }
+  .job:hover, .job.active { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+  .job .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .job .meta { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .bar { height: 5px; background: var(--track); border-radius: 3px; overflow: hidden; margin-top: 7px; }
+  .bar > i { display: block; height: 100%; background: var(--accent); transition: width .4s; }
+  .pill { font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 99px; background: var(--track); color: var(--muted); }
+  .pill.done { color: var(--ok); } .pill.failed { color: var(--bad); }
+  #detail .head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  #detail h3 { margin: 0; font-size: 20px; font-weight: 650; }
+  #detail .msg { color: var(--muted); }
+  .stats { display: flex; gap: 22px; flex-wrap: wrap; margin: 14px 0 4px; }
+  .stat b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--muted); font-size: 12px; }
+  .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; margin-top: 18px; }
+  .shot { position: relative; border-radius: 10px; overflow: hidden; background: var(--track); aspect-ratio: 16/9; cursor: zoom-in; }
+  .shot img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .shot .cap { position: absolute; left: 0; right: 0; bottom: 0; padding: 18px 10px 7px; color: #fff; font-size: 12.5px; font-weight: 600;
+               background: linear-gradient(transparent, rgba(0,0,0,.6)); display: flex; justify-content: space-between; }
+  .shot.pending { display: grid; place-items: center; color: var(--muted); font-size: 12px; cursor: default; }
+  .plan { margin-top: 22px; display: grid; grid-template-columns: minmax(200px, 360px) 1fr; gap: 18px; align-items: start; }
+  @media (max-width: 700px) { .plan { grid-template-columns: 1fr; } }
+  .plan img { width: 100%; border-radius: 10px; border: 1px solid var(--line); background: #fafafa; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  td, th { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  pre.err { white-space: pre-wrap; background: color-mix(in srgb, var(--bad) 8%, transparent); color: var(--bad);
+            padding: 12px; border-radius: 8px; font-size: 12px; max-height: 260px; overflow: auto; }
+  .empty { color: var(--muted); text-align: center; padding: 80px 20px; }
+  #lightbox { position: fixed; inset: 0; background: rgba(10,10,10,.92); display: none; flex-direction: column;
+              align-items: center; justify-content: center; gap: 12px; z-index: 10; padding: 20px; }
+  #lightbox.open { display: flex; }
+  #lightbox img { max-width: 100%; max-height: calc(100vh - 110px); border-radius: 6px; }
+  #lightbox .bar2 { display: flex; gap: 14px; align-items: center; color: #eee; }
+  #lightbox a, #lightbox button { color: #fff; background: rgba(255,255,255,.12); border: 0; border-radius: 8px;
+                                  padding: 7px 14px; font: inherit; cursor: pointer; text-decoration: none; }
+</style>
+</head>
+<body>
+<header>
+  <div class="dot"></div>
+  <h1>SketchUp Render Studio</h1>
+  <div class="sub">Upload a .skp and get photoreal renders of every scene</div>
+</header>
+<main>
+  <aside>
+    <div class="card pad">
+      <h2>New render</h2>
+      <div id="drop">
+        <strong>Drop your SketchUp file</strong>
+        <span>or click to browse (.skp, SketchUp 2023 or older)</span>
+        <div class="file" id="fname"></div>
+      </div>
+      <input type="file" id="file" accept=".skp" hidden>
+      <div class="opts">
+        <label class="f">Quality
+          <select id="quality">
+            <option value="draft">Draft (fast check)</option>
+            <option value="preview">Preview</option>
+            <option value="final" selected>Final 1080p</option>
+            <option value="4k">4K</option>
+          </select></label>
+        <label class="f">Lighting
+          <select id="mode"><option value="day">Day</option><option value="night">Night</option></select></label>
+        <label class="f">Cameras
+          <select id="auto">
+            <option value="missing">SketchUp scenes (auto if none)</option>
+            <option value="always">Scenes + auto room views</option>
+            <option value="never">SketchUp scenes only</option>
+          </select></label>
+        <label class="f">Time limit (minutes)
+          <input type="number" id="budget" min="0" step="1" value="0"></label>
+      </div>
+      <button class="primary" id="go" disabled>Render</button>
+    </div>
+    <div class="card jobs">
+      <div class="pad" style="padding-bottom:10px"><h2 style="margin:0">Jobs</h2></div>
+      <div id="joblist"></div>
+    </div>
+  </aside>
+  <section class="card pad" id="detail"><div class="empty">Upload a model to start. Renders appear here as they finish.</div></section>
+</main>
+<div id="lightbox">
+  <img id="lbimg" alt="">
+  <div class="bar2">
+    <button id="lbprev">‹</button><span id="lbcap"></span><button id="lbnext">›</button>
+    <a id="lbdl" download>Download</a><button id="lbclose">Close</button>
+  </div>
+</div>
+<script>
+const $ = s => document.querySelector(s);
+let selected = null, file = null, jobs = [], lbList = [], lbIdx = 0;
+
+const drop = $('#drop'), input = $('#file');
+drop.onclick = () => input.click();
+input.onchange = () => pick(input.files[0]);
+drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
+drop.ondragleave = () => drop.classList.remove('over');
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); pick(e.dataTransfer.files[0]); };
+function pick(f) {
+  if (!f) return;
+  if (!f.name.toLowerCase().endsWith('.skp')) { alert('Please choose a SketchUp .skp file'); return; }
+  file = f; $('#fname').textContent = `${f.name} · ${(f.size / 1e6).toFixed(1)} MB`; $('#go').disabled = false;
+}
+
+$('#go').onclick = async () => {
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('quality', $('#quality').value);
+  fd.append('mode', $('#mode').value);
+  fd.append('auto_cameras', $('#auto').value);
+  fd.append('time_budget', String(Number($('#budget').value || 0) * 60));
+  $('#go').disabled = true; $('#go').textContent = 'Uploading…';
+  try {
+    const r = await fetch('/api/jobs', { method: 'POST', body: fd });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'Upload failed');
+    selected = d.id; file = null; $('#fname').textContent = ''; input.value = '';
+    await refresh();
+  } catch (e) { alert(e.message); $('#go').disabled = false; }
+  $('#go').textContent = 'Render';
+};
+
+const fmtTime = s => s == null ? '–' : s < 90 ? `${Math.round(s)}s` : `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fileUrl = (id, f) => `/api/jobs/${id}/files/${encodeURIComponent(f)}`;
+
+function renderList() {
+  $('#joblist').innerHTML = jobs.map(j => `
+    <button class="job ${j.id === selected ? 'active' : ''}" data-id="${j.id}">
+      <div class="name">${esc(j.filename)}</div>
+      <div class="meta"><span>${esc(j.options?.quality || '')} · ${new Date(j.created * 1000).toLocaleString()}</span>
+        <span class="pill ${j.status}">${j.status}</span></div>
+      ${j.status === 'done' || j.status === 'failed' ? '' : `<div class="bar"><i style="width:${(j.progress * 100).toFixed(0)}%"></i></div>`}
+    </button>`).join('') || '<div class="pad" style="color:var(--muted)">No jobs yet</div>';
+  document.querySelectorAll('.job').forEach(b => b.onclick = () => { selected = b.dataset.id; refresh(); });
+}
+
+async function renderDetail() {
+  if (!selected) return;
+  const r = await fetch(`/api/jobs/${selected}`);
+  if (!r.ok) return;
+  const j = await r.json();
+  const views = j.views || [];
+  const rep = j.report || {};
+  const elapsed = j.finished ? j.finished - j.started : j.started ? Date.now() / 1000 - j.started : null;
+  const pending = Math.max(0, (j.total || 0) - views.length);
+  lbList = views.map(v => ({ src: fileUrl(j.id, v.file), name: v.name, file: v.file }));
+  const rooms = rep.rooms || [];
+  $('#detail').innerHTML = `
+    <div class="head"><h3>${esc(j.filename)}</h3><span class="pill ${j.status}">${j.status}</span>
+      <span class="msg">${esc(j.message)}</span></div>
+    ${j.status === 'done' || j.status === 'failed' ? '' : `<div class="bar" style="height:7px"><i style="width:${(j.progress * 100).toFixed(1)}%"></i></div>`}
+    <div class="stats">
+      <div class="stat"><b>${views.length}${j.total ? ' / ' + j.total : ''}</b><span>views</span></div>
+      <div class="stat"><b>${fmtTime(elapsed)}</b><span>elapsed</span></div>
+      ${rep.convert_seconds != null ? `<div class="stat"><b>${fmtTime(rep.convert_seconds)}</b><span>model import</span></div>` : ''}
+      ${views.length ? `<div class="stat"><b>${fmtTime(views.reduce((a, v) => a + v.seconds, 0) / views.length)}</b><span>per view</span></div>` : ''}
+    </div>
+    ${j.status === 'failed' ? `<pre class="err">${esc(j.error || 'Unknown error')}</pre>` : ''}
+    <div class="gallery">
+      ${views.map((v, i) => `<div class="shot" data-i="${i}"><img loading="lazy" src="${fileUrl(j.id, v.file)}" alt="${esc(v.name)}">
+        <div class="cap"><span>${esc(v.name)}</span><span>${fmtTime(v.seconds)}</span></div></div>`).join('')}
+      ${Array.from({ length: pending }, () => '<div class="shot pending">Rendering…</div>').join('')}
+    </div>
+    ${j.has_plan ? `<div class="plan"><img src="${fileUrl(j.id, 'plan.png')}" alt="Detected rooms and cameras">
+      <div><h2>Detected rooms</h2><table><tr><th>Room</th><th>Area</th><th>Ceiling</th></tr>
+      ${rooms.map(r => `<tr><td>${esc(r.name)}</td><td>${r.area_m2} m²</td><td>${r.has_ceiling ? 'modelled' : 'added'}</td></tr>`).join('')}
+      </table></div></div>` : ''}`;
+  document.querySelectorAll('.shot[data-i]').forEach(s => s.onclick = () => openLb(+s.dataset.i));
+}
+
+function openLb(i) { lbIdx = (i + lbList.length) % lbList.length; const v = lbList[lbIdx];
+  $('#lbimg').src = v.src; $('#lbcap').textContent = v.name; $('#lbdl').href = v.src; $('#lbdl').download = v.file;
+  $('#lightbox').classList.add('open'); }
+$('#lbclose').onclick = () => $('#lightbox').classList.remove('open');
+$('#lbprev').onclick = () => openLb(lbIdx - 1);
+$('#lbnext').onclick = () => openLb(lbIdx + 1);
+document.onkeydown = e => { if (!$('#lightbox').classList.contains('open')) return;
+  if (e.key === 'Escape') $('#lbclose').click(); if (e.key === 'ArrowLeft') openLb(lbIdx - 1); if (e.key === 'ArrowRight') openLb(lbIdx + 1); };
+
+let lastSig = '';
+async function refresh() {
+  const r = await fetch('/api/jobs');
+  jobs = await r.json();
+  if (!selected && jobs.length) selected = jobs[0].id;
+  renderList();
+  const cur = jobs.find(j => j.id === selected);
+  const sig = cur ? `${cur.id}:${cur.status}:${cur.done}:${cur.message}` : '';
+  if (sig !== lastSig) { lastSig = sig; await renderDetail(); }
+  else if (cur && !['done', 'failed'].includes(cur.status)) await renderDetail();
+}
+refresh();
+setInterval(refresh, 2500);
+</script>
+</body>
+</html>

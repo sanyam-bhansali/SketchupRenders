@@ -1,0 +1,22 @@
+# Client models and generated output (confidential / large)
+*.skp
+*.skb
+data/
+work/
+renders/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Blender / render temp
+*.blend
+*.blend1
+*.exr
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
