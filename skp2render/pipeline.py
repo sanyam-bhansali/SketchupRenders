@@ -25,6 +25,7 @@ BLENDER_PY = os.environ.get(
 BUILD = os.path.join(ROOT, "skp2render", "blender_build.py")
 
 QUALITY = {
+    "instant": {"width": 1920, "samples": 64, "engine": "eevee"},   # real-time engine, seconds per view
     "draft": {"width": 960, "samples": 32},
     "preview": {"width": 1280, "samples": 96},
     "final": {"width": 1920, "samples": 512},
@@ -109,7 +110,7 @@ def run(skp, out_dir, work_dir, options=None, on_event=None):
 
     q = QUALITY[opts["quality"]]
     common = ["--package", work_dir, "--out", out_dir, "--width", str(q["width"]), "--samples", str(q["samples"]),
-              "--mode", opts["mode"], "--aspect", str(opts["aspect"])]
+              "--mode", opts["mode"], "--aspect", str(opts["aspect"]), "--engine", q.get("engine", "cycles")]
     if not opts.get("model_lights", True):
         common.append("--no-model-lights")
     lock = threading.Lock()

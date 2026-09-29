@@ -36,6 +36,48 @@ def reset_scene():
     return scene
 
 
+def setup_eevee(scene, samples):
+    """Real-time engine for 'Instant' renders: ray-traced reflections + fast GI + baked bounce."""
+    scene.render.engine = "BLENDER_EEVEE"
+    e = scene.eevee
+    e.taa_render_samples = samples
+    e.use_raytracing = True
+    e.ray_tracing_method = "SCREEN"
+    e.ray_tracing_options.resolution_scale = "1"
+    e.ray_tracing_options.use_denoise = True
+    e.use_fast_gi = True
+    try:
+        e.fast_gi_method = "GLOBAL_ILLUMINATION"
+    except TypeError:
+        pass
+    e.fast_gi_ray_count = 4
+    e.fast_gi_step_count = 12
+    e.use_shadows = True
+    # Interiors carry ~100 lights (fixtures, strips, fills); the default pool overflows and
+    # dropped shadow tiles let sunlight leak through walls.
+    e.shadow_pool_size = "1024"
+    e.shadow_resolution_scale = 0.5
+    e.shadow_ray_count = 2
+    e.shadow_step_count = 8
+    e.clamp_surface_indirect = 10.0
+    e.gi_diffuse_bounces = 3
+    # Screen-space fast GI gave swirly blotches on plain walls; the baked irradiance volume
+    # (bake_irradiance) plus ray-traced reflections gives cleaner, more natural bounce light.
+    e.use_fast_gi = False
+    scene.render.dither_intensity = 1.5   # hides banding in smooth wall gradients
+    variant = os.environ.get("SKP_EEVEE_VARIANT", "")
+    if "nofastgi" in variant:
+        e.use_fast_gi = False
+    if "hq" in variant:
+        e.fast_gi_resolution = "1"
+        e.fast_gi_quality = 1.0
+        e.fast_gi_ray_count = 8
+        e.fast_gi_step_count = 16
+    if "nodenoise" in variant:
+        e.ray_tracing_options.use_denoise = False
+    log(f"engine: EEVEE (instant) {variant}")
+
+
 def setup_cycles(scene, samples, width, height):
     prefs = bpy.context.preferences.addons["cycles"].preferences
     backend = None
@@ -376,6 +418,19 @@ class Builder:
 
     def add_tube(self, name, xf, length, watts, occ):
         """Linear light: an emissive cylinder along local Y, hidden from camera."""
+        if self.opts.engine == "eevee":
+            # EEVEE only lights the room from emissive meshes via GI; use a real area light.
+            ld = bpy.data.lights.new(name, "AREA")
+            ld.shape = "RECTANGLE"
+            ld.size, ld.size_y = 0.03, max(length, 0.05)
+            ld.energy = watts
+            ld.color = kelvin_to_rgb(WARM_K)
+            ob = bpy.data.objects.new(name, ld)
+            loc, rot, _ = xf.decompose()
+            ob.matrix_world = Matrix.LocRotScale(loc, rot, Vector((1, 1, 1)))
+            self.light_coll.objects.link(ob)
+            self.objects.append((ob, occ))
+            return
         radius = 0.008
         segs = 8
         ang = np.linspace(0, 2 * np.pi, segs, endpoint=False)
@@ -630,6 +685,44 @@ class Builder:
                                   log=log)
         plan.write_png(plan_png)
         return views, plan.room_info()
+
+    def bake_irradiance(self, room_lights, floor, spacing=0.2):
+        """EEVEE bounce light: one irradiance volume over all rooms, baked once per process."""
+        if not room_lights:
+            return 0.0
+        xs = [r["centre"][0] + s * r["size"][0] / 1.2 for r in room_lights for s in (-1, 1)]
+        ys = [r["centre"][1] + s * r["size"][1] / 1.2 for r in room_lights for s in (-1, 1)]
+        z0 = floor if floor is not None else min(r["centre"][2] for r in room_lights) - 2.8
+        z1 = max(r["centre"][2] for r in room_lights)
+        lo = Vector((min(xs) - 0.5, min(ys) - 0.5, z0))
+        hi = Vector((max(xs) + 0.5, max(ys) + 0.5, z1))
+        size = hi - lo
+        lp = bpy.data.lightprobes.new("Irradiance", "VOLUME")
+        lp.resolution_x = int(min(max(size.x / spacing, 4), 96))
+        lp.resolution_y = int(min(max(size.y / spacing, 4), 96))
+        lp.resolution_z = int(min(max(size.z / spacing, 3), 20))
+        lp.bake_samples = 512
+        ob = bpy.data.objects.new("Irradiance", lp)
+        ob.location = (lo + hi) / 2
+        ob.scale = size / 2
+        bpy.context.scene.collection.objects.link(ob)
+        # Reflection probe per room: screen-space reflections can't see behind the camera,
+        # so mirrors and glossy floors would reflect black.
+        for i, r in enumerate(room_lights):
+            sp = bpy.data.lightprobes.new(f"Reflection_{i}", "SPHERE")
+            sp.influence_distance = max(r["size"]) / 1.2 + 0.6
+            sp.falloff = 0.3
+            so = bpy.data.objects.new(f"Reflection_{i}", sp)
+            so.location = (r["centre"][0], r["centre"][1], (z0 + r["centre"][2]) / 2)
+            bpy.context.scene.collection.objects.link(so)
+        t = time.time()
+        try:
+            bpy.context.view_layer.objects.active = ob
+            bpy.ops.object.lightprobe_cache_bake(subset="ALL")
+        except RuntimeError as e:
+            log(f"irradiance bake failed: {e}")
+            return -1.0
+        return time.time() - t
 
     def add_room_lights(self, room_lights, strength):
         """Soft warm ceiling light in every room, so rooms seen through doors/glass aren't black."""
@@ -1035,11 +1128,13 @@ def setup_bloom(scene):
 def auto_exposure(scene, target, tmpdir):
     """Quick low-res render, measure log-average luminance, set exposure."""
     r, c = scene.render, scene.cycles
-    saved = (r.resolution_percentage, c.samples, r.image_settings.file_format, r.filepath)
+    saved = (r.resolution_percentage, c.samples, scene.eevee.taa_render_samples,
+             r.image_settings.file_format, r.filepath)
     vs = scene.view_settings
     vs.exposure = 0.0
     r.resolution_percentage = 20
     c.samples = 24
+    scene.eevee.taa_render_samples = 8
     r.image_settings.file_format = "OPEN_EXR"
     path = os.path.join(tmpdir, f"_exposure_{os.getpid()}.exr")  # unique per parallel process
     r.filepath = path
@@ -1070,7 +1165,8 @@ def auto_exposure(scene, target, tmpdir):
             # Correct only part of the cast and keep interiors warm (client expectation);
             # strongly blue daylight views are still pulled back toward neutral.
             vs.white_balance_temperature = max(4600.0, min(6500.0, 0.35 * cct + 0.65 * 5200.0))
-    r.resolution_percentage, c.samples, r.image_settings.file_format, r.filepath = saved
+    (r.resolution_percentage, c.samples, scene.eevee.taa_render_samples,
+     r.image_settings.file_format, r.filepath) = saved
     return key, ev, getattr(vs, "white_balance_temperature", 6500)
 
 
@@ -1083,6 +1179,7 @@ def parse_args():
     ap.add_argument("--width", type=int, default=1600)
     ap.add_argument("--aspect", type=float, default=16 / 9)
     ap.add_argument("--samples", type=int, default=256)
+    ap.add_argument("--engine", choices=["cycles", "eevee"], default="cycles")
     ap.add_argument("--scenes", default="all", help="comma-separated scene names or indices, or 'all'")
     ap.add_argument("--max-views", type=int, default=0)
     ap.add_argument("--light-scale", type=float, default=1.0)
@@ -1122,11 +1219,13 @@ def main():
     scene = reset_scene()
     height = int(round(opts.width / opts.aspect))
     setup_cycles(scene, opts.samples, opts.width, height)
+    if opts.engine == "eevee":
+        setup_eevee(scene, opts.samples)
     b = Builder(opts.package, opts)
     b.build_geometry()
     b.build_lights()
     b.build_environment(b.data.get("shadow", {}))
-    if opts.mode == "day" and opts.portals:
+    if opts.mode == "day" and opts.portals and opts.engine == "cycles":
         log(f"window portals: {b.add_window_portals()}")
     if opts.bloom:
         setup_bloom(scene)
@@ -1142,6 +1241,10 @@ def main():
             b.add_room_lights(planned.get("room_lights", []), opts.room_light)
         if opts.fixture_lights:
             log(f"under-cabinet strips: {b.add_strips(planned.get('strips', []))}")
+        if opts.engine == "eevee":
+            b.apply_view_visibility({})
+            dt = b.bake_irradiance(planned.get("room_lights", []), planned.get("floor"))
+            log(f"irradiance bake: {dt:.1f}s")
     else:
         views = [dict(s) for s in b.data["scenes"]]
         rooms = []
@@ -1185,7 +1288,8 @@ def main():
         if opts.time_budget:
             # Share what's left of the budget between the remaining views (~3 s overhead each).
             left = opts.time_budget - (time.time() - t0)
-            scene.cycles.time_limit = max(6.0, left / (len(views) - i) - 3.0)
+            if opts.engine == "cycles":
+                scene.cycles.time_limit = max(6.0, left / (len(views) - i) - 3.0)
         # A SketchUp camera with a fixed aspect ratio defines the designer's frame: render that.
         aspect = v["camera"].get("aspect") or opts.aspect
         scene.render.resolution_y = int(round(opts.width / aspect))
