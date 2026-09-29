@@ -19,7 +19,7 @@ RULES = [
     ("metal", r"(^|[^a-z])(ss|steel|stainless|chrome|metal\w*|alumin\w*|brass|gold|copper|bronze|nickel|iron|titanium|rose ?gold)([^a-z]|$)"),
     ("water", r"water"),
     ("leather", r"leather|rexine"),
-    ("fabric", r"fabric|cushion|cusion|curtain|cortain|carpet|rug|linen|velvet|cloth|textile|sofa|upholster|bed ?sheet|pillow|towel|blind|drape|jute|wool"),
+    ("fabric", r"fabric|cushion|cusion|curtain|cortain|纱帘|窗帘|布艺|carpet|rug|linen|velvet|cloth|textile|sofa|upholster|bed ?sheet|pillow|towel|blind|drape|jute|wool"),
     ("stone", r"marble|granite|stone|quartz|onyx|travertine|terrazzo|slate|kota|\bcorian\b"),
     ("tile", r"tile|porcelain|ceramic|vitrified|mosaic"),
     ("wood", r"wood|veneer|oak|walnut|teak|ash|maple|cherry|pine|birch|timber|plywood|mdf|parquet|floor ?board"),
@@ -105,7 +105,8 @@ def build_material(info, pkg_dir):
 
     p = PRESETS.get(cls, PRESETS["paint"])
     tex_node = None
-    tex = info.get("texture") if info else None
+    # Mirror "textures" in SketchUp are fake reflection pictures; a real mirror reflects the room.
+    tex = info.get("texture") if info and cls != "mirror" else None
     if tex:
         path = os.path.join(pkg_dir, tex["file"])
         if os.path.exists(path):
@@ -159,11 +160,68 @@ def build_material(info, pkg_dir):
                 links.new(bevel.outputs[0], bump.inputs["Normal"])
             links.new(bump.outputs[0], bsdf.inputs["Normal"])
 
+    # Micro-detail: perfectly uniform surfaces are what make renders look CG.
+    micro = MICRO.get(cls)
+    if micro and tex_node is None:
+        nrm_src = bsdf.inputs["Normal"].links[0].from_socket if bsdf.inputs["Normal"].is_linked else None
+        bump = _noise_bump(nodes, links, micro["scale"], micro["bump"], nrm_src)
+        links.new(bump, bsdf.inputs["Normal"])
+    if cls in ROUGHNESS_BREAKUP and not bsdf.inputs["Roughness"].is_linked:
+        # Slight gloss variation (wear, polish) on floors, counters and joinery.
+        tc = nodes.new("ShaderNodeTexCoord")
+        nz = nodes.new("ShaderNodeTexNoise")
+        nz.inputs["Scale"].default_value = 6.0
+        nz.inputs["Detail"].default_value = 4.0
+        links.new(tc.outputs["Object"], nz.inputs["Vector"])
+        mr = nodes.new("ShaderNodeMapRange")
+        base = p.get("rough", 0.4)
+        mr.inputs["To Min"].default_value = max(base - 0.06, 0.02)
+        mr.inputs["To Max"].default_value = base + 0.08
+        links.new(nz.outputs["Fac"], mr.inputs["Value"])
+        links.new(mr.outputs[0], bsdf.inputs["Roughness"])
+    if info and CURTAIN.search(info["name"] + " " + (info.get("texture") or {}).get("source_name", "")):
+        # Curtains let light through (backlit glow at windows).
+        out_link = out.inputs["Surface"].links[0].from_socket
+        tr = nodes.new("ShaderNodeBsdfTranslucent")
+        tr.inputs["Color"].default_value = bsdf.inputs["Base Color"].default_value
+        if bsdf.inputs["Base Color"].is_linked:
+            links.new(bsdf.inputs["Base Color"].links[0].from_socket, tr.inputs["Color"])
+        mix = nodes.new("ShaderNodeMixShader")
+        mix.inputs[0].default_value = 0.35 if re.search(r"sheer|纱", info["name"], re.I) else 0.18
+        links.new(out_link, mix.inputs[1])
+        links.new(tr.outputs[0], mix.inputs[2])
+        links.new(mix.outputs[0], out.inputs["Surface"])
     if cls == "emissive":
         emit_col = lin if max(lin) > 0.05 else (1.0, 0.8, 0.55)
         _set(bsdf, "Emission Color", (*emit_col, 1.0))
         _set(bsdf, "Emission Strength", 6.0)
     return mat
+
+
+MICRO = {
+    "paint": {"scale": 90.0, "bump": 0.025},       # plaster / emulsion orange-peel
+    "fabric": {"scale": 450.0, "bump": 0.22},      # weave
+    "leather": {"scale": 220.0, "bump": 0.12},     # grain
+    "concrete": {"scale": 40.0, "bump": 0.3},
+    "plastic": {"scale": 150.0, "bump": 0.015},
+}
+ROUGHNESS_BREAKUP = {"stone", "tile", "laminate", "wood", "paint", "metal"}
+CURTAIN = re.compile(r"curtain|cortain|drape|sheer|blind|纱帘|窗帘", re.I)
+
+
+def _noise_bump(nodes, links, scale, strength, normal_socket=None):
+    tc = nodes.new("ShaderNodeTexCoord")
+    nz = nodes.new("ShaderNodeTexNoise")
+    nz.inputs["Scale"].default_value = scale
+    nz.inputs["Detail"].default_value = 6.0
+    links.new(tc.outputs["Object"], nz.inputs["Vector"])
+    bump = nodes.new("ShaderNodeBump")
+    bump.inputs["Strength"].default_value = strength
+    bump.inputs["Distance"].default_value = 0.0005
+    links.new(nz.outputs["Fac"], bump.inputs["Height"])
+    if normal_socket is not None:
+        links.new(normal_socket, bump.inputs["Normal"])
+    return bump.outputs["Normal"]
 
 
 def _thin_glass(mat, lin, info):
