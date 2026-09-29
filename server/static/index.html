@@ -26,6 +26,25 @@
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); }
   .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 12px; font-weight: 600; }
   .pad { padding: 18px; }
+  main[hidden] { display: none; }
+  header .tabs { margin-left: auto; display: flex; gap: 6px; }
+  .tab { font: inherit; font-size: 13px; padding: 7px 12px; border-radius: 8px; border: 1px solid var(--line);
+         background: var(--panel); color: var(--ink); cursor: pointer; }
+  .tab.active { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .hint { color: var(--muted); font-size: 12px; margin: 12px 0 0; }
+  .drop { border: 1.5px dashed var(--line); border-radius: 10px; padding: 26px 12px; text-align: center; cursor: pointer; }
+  .drop:hover, .drop.over { border-color: var(--accent); }
+  .drop strong { display: block; font-size: 15px; margin-bottom: 4px; }
+  .drop span { color: var(--muted); font-size: 13px; }
+  .drop .file { margin-top: 10px; font-weight: 600; color: var(--accent); word-break: break-all; }
+  .options { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; margin-top: 16px; }
+  .opt { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--bg); }
+  .opt img { width: 100%; display: block; background: #fff; cursor: zoom-in; }
+  .opt .body { padding: 10px 12px; }
+  .opt .body b { font-size: 14px; }
+  .opt .meta { color: var(--muted); font-size: 12px; margin: 4px 0 8px; }
+  .opt a.dl { display: inline-block; background: var(--accent); color: var(--accent-ink); padding: 6px 12px;
+              border-radius: 7px; text-decoration: none; font-weight: 600; font-size: 13px; }
   #drop { border: 1.5px dashed var(--line); border-radius: 10px; padding: 26px 12px; text-align: center; cursor: pointer;
           transition: border-color .15s, background .15s; }
   #drop.over, #drop:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 6%, transparent); }
@@ -83,9 +102,12 @@
 <header>
   <div class="dot"></div>
   <h1>SketchUp Render Studio</h1>
-  <div class="sub">Upload a .skp and get photoreal renders of every scene</div>
+  <nav class="tabs">
+    <button class="tab active" data-tab="renders">Renders</button>
+    <button class="tab" data-tab="plans">2D Plan &rarr; 3D SketchUp</button>
+  </nav>
 </header>
-<main>
+<main id="tab-renders">
   <aside>
     <div class="card pad">
       <h2>New render</h2>
@@ -123,6 +145,27 @@
     </div>
   </aside>
   <section class="card pad" id="detail"><div class="empty">Upload a model to start. Renders appear here as they finish.</div></section>
+</main>
+<main id="tab-plans" hidden>
+  <aside>
+    <div class="card pad">
+      <h2>AutoCAD plan to SketchUp</h2>
+      <div id="pdrop" class="drop">
+        <strong>Drop a DWG floor plan</strong>
+        <span>AutoCAD .dwg (or .dxf). Every layout option in the drawing becomes its own model.</span>
+        <div class="file" id="pname"></div>
+      </div>
+      <input type="file" id="pfile" accept=".dwg,.dxf" hidden>
+      <div class="opts">
+        <label class="f">Wall height (m)
+          <input type="number" id="wallh" min="2.4" max="4.5" step="0.05" value="3.0"></label>
+      </div>
+      <button class="primary" id="pgo" disabled>Convert to 3D</button>
+      <p class="hint">Walls come from the double wall lines, windows from glazing lines, doors from door
+        blocks, and room names from the plan's text labels. Open the .skp in SketchUp to continue designing.</p>
+    </div>
+  </aside>
+  <section class="card pad" id="pdetail"><div class="empty">Upload a DWG to generate editable 3D models.</div></section>
 </main>
 <div id="lightbox">
   <img id="lbimg" alt="">
@@ -236,6 +279,57 @@ async function refresh() {
 }
 refresh();
 setInterval(refresh, 2500);
+
+// ---------------------------------------------------------------- tabs
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x === t));
+  $('#tab-renders').hidden = t.dataset.tab !== 'renders';
+  $('#tab-plans').hidden = t.dataset.tab !== 'plans';
+});
+
+// ---------------------------------------------------------------- 2D plan -> 3D
+let pfile = null;
+const pdrop = $('#pdrop'), pinput = $('#pfile');
+pdrop.onclick = () => pinput.click();
+pinput.onchange = () => ppick(pinput.files[0]);
+pdrop.ondragover = e => { e.preventDefault(); pdrop.classList.add('over'); };
+pdrop.ondragleave = () => pdrop.classList.remove('over');
+pdrop.ondrop = e => { e.preventDefault(); pdrop.classList.remove('over'); ppick(e.dataTransfer.files[0]); };
+function ppick(f) {
+  if (!f) return;
+  if (!/\.(dwg|dxf)$/i.test(f.name)) { alert('Please choose an AutoCAD .dwg or .dxf file'); return; }
+  pfile = f; $('#pname').textContent = `${f.name} · ${(f.size / 1e6).toFixed(1)} MB`; $('#pgo').disabled = false;
+}
+$('#pgo').onclick = async () => {
+  const fd = new FormData();
+  fd.append('file', pfile);
+  fd.append('wall_height', $('#wallh').value || '3.0');
+  $('#pgo').disabled = true; $('#pgo').textContent = 'Converting…';
+  $('#pdetail').innerHTML = '<div class="empty">Reading the drawing and building 3D models…</div>';
+  try {
+    const r = await fetch('/api/plans', { method: 'POST', body: fd });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'Conversion failed');
+    showPlan(d);
+  } catch (e) { $('#pdetail').innerHTML = `<pre class="err">${esc(e.message)}</pre>`; }
+  $('#pgo').disabled = false; $('#pgo').textContent = 'Convert to 3D';
+};
+function showPlan(d) {
+  const url = f => `/api/plans/${d.id}/files/${f}`;
+  lbList = d.options.map(o => ({ src: url(o.preview), name: `Option ${o.option}`, file: o.preview }));
+  $('#pdetail').innerHTML = `
+    <div class="head"><h3>${esc(d.filename)}</h3>
+      <span class="msg">${d.options.length} layout option(s) found in ${fmtTime(d.total_seconds)}</span></div>
+    <div class="options">${d.options.map((o, i) => `
+      <div class="opt"><img src="${url(o.preview)}" data-i="${i}" alt="Option ${o.option}">
+        <div class="body"><b>Option ${o.option}</b> · ${o.size_m[0]} × ${o.size_m[1]} m
+          <div class="meta">${o.rooms} rooms · ${o.doors} doors · ${o.windows} windows<br>
+            ${esc(o.room_names.join(', ') || 'No room labels found')}</div>
+          <a class="dl" href="${url(o.skp)}" download="${esc(d.filename.replace(/\.(dwg|dxf)$/i, ''))}_option${o.option}.skp">Download .skp</a>
+        </div></div>`).join('')}
+    </div>`;
+  document.querySelectorAll('.opt img').forEach(im => im.onclick = () => openLb(+im.dataset.i));
+}
 </script>
 </body>
 </html>

@@ -97,4 +97,44 @@ def job_file(job_id: str, name: str):
     return FileResponse(path)
 
 
+# ---------------------------------------------------------------- 2D plan (DWG) -> 3D SketchUp
+PLANS_DIR = os.path.join(os.path.dirname(store.job_dir("x")), "..", "plans")
+PLAN_FILES = re.compile(r"^option\d+\.(skp|png)$|^result\.json$")
+
+
+@app.post("/api/plans")
+async def create_plan(file: UploadFile = File(...), wall_height: float = Form(3.0)):
+    """Convert a DWG/DXF floor plan into editable SketchUp models (one per layout option)."""
+    import uuid
+    from starlette.concurrency import run_in_threadpool
+    from plan2skp.service import process
+    ext = os.path.splitext(file.filename.lower())[1]
+    if ext not in (".dwg", ".dxf"):
+        raise HTTPException(400, "Please upload an AutoCAD .dwg (or .dxf) floor plan")
+    if not 2.4 <= wall_height <= 4.5:
+        raise HTTPException(400, "Wall height must be between 2.4 and 4.5 m")
+    plan_id = uuid.uuid4().hex[:12]
+    d = os.path.abspath(os.path.join(PLANS_DIR, plan_id))
+    os.makedirs(d, exist_ok=True)
+    src = os.path.join(d, "plan" + ext)
+    with open(src, "wb") as f:
+        while chunk := await file.read(1 << 20):
+            f.write(chunk)
+    try:
+        result = await run_in_threadpool(process, src, d, wall_height)
+    except Exception as e:  # report conversion problems to the UI
+        raise HTTPException(422, f"Could not read this drawing: {e}")
+    return {"id": plan_id, "filename": os.path.basename(file.filename), **result}
+
+
+@app.get("/api/plans/{plan_id}/files/{name}")
+def plan_file(plan_id: str, name: str):
+    if not re.fullmatch(r"[0-9a-f]{12}", plan_id) or not PLAN_FILES.match(name):
+        raise HTTPException(404)
+    path = os.path.abspath(os.path.join(PLANS_DIR, plan_id, name))
+    if not os.path.isfile(path):
+        raise HTTPException(404)
+    return FileResponse(path, filename=name if name.endswith(".skp") else None)
+
+
 app.mount("/", StaticFiles(directory=STATIC, html=True), name="ui")
